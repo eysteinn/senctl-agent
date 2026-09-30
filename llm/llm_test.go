@@ -149,3 +149,38 @@ func TestOpenAIToolRoundTrip(t *testing.T) {
 		t.Fatalf("http error = %v", err)
 	}
 }
+
+func TestOpenAIFindsV1(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = io.WriteString(w, `{"data":[{"id":"m"}]}`)
+		case "/v1/chat/completions":
+			_, _ = io.WriteString(w, `{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	p := NewOpenAI(OpenAIConfig{BaseURL: srv.URL})
+	ids, err := p.(ModelLister).ListModels(context.Background())
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("models = %v, %v", ids, err)
+	}
+	turn, err := p.NewConversation(Options{Model: "m"}, "", nil).Send(context.Background(), "hello", nil)
+	if err != nil || turn.Text != "hi" {
+		t.Fatalf("turn = %+v, %v", turn, err)
+	}
+	// Once found, /v1 is used directly.
+	if got := strings.Join(paths, " "); got != "/models /v1/models /v1/chat/completions" {
+		t.Fatalf("paths = %s", got)
+	}
+
+	// A real 404 is still reported.
+	p = NewOpenAI(OpenAIConfig{BaseURL: srv.URL + "/nowhere"})
+	if _, err := p.NewConversation(Options{Model: "m"}, "", nil).Send(context.Background(), "hello", nil); err == nil || !strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("err = %v", err)
+	}
+}

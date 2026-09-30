@@ -14,8 +14,9 @@ const (
 // Config selects and configures a provider. It is what a config file or
 // environment maps onto.
 type Config struct {
-	// Provider is "openai" (any OpenAI-compatible chat completions
-	// endpoint, including LLM proxies/gateways) or "anthropic".
+	// Provider is "openai" (the default: the OpenAI chat completions API
+	// that LLM proxies and gateways speak) or "anthropic" (the Anthropic
+	// Messages API, for talking to it directly).
 	Provider string
 	APIKey   string
 	// BaseURL points at the endpoint. For openai it is the API root such
@@ -31,7 +32,7 @@ type Config struct {
 // New builds the provider described by cfg.
 func New(cfg Config) (Provider, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
-	case ProviderOpenAI:
+	case ProviderOpenAI, "":
 		return NewOpenAI(OpenAIConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, SendEffort: cfg.SendEffort}), nil
 	case ProviderAnthropic:
 		fallbacks := cfg.BaseURL == ""
@@ -39,8 +40,6 @@ func New(cfg Config) (Provider, error) {
 			fallbacks = *cfg.Fallbacks
 		}
 		return NewAnthropic(AnthropicConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, Fallbacks: fallbacks}), nil
-	case "":
-		return nil, fmt.Errorf("llm: no provider configured (openai or anthropic)")
 	}
 	return nil, fmt.Errorf("llm: unknown provider %q (openai or anthropic)", cfg.Provider)
 }

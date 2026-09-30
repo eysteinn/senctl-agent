@@ -3,8 +3,9 @@
 A small Go harness for tool-using LLM agents, usable as a **library** or as a
 **command-line tool**.
 
-- Talks to any **OpenAI-compatible** chat-completions endpoint (OpenAI, Azure
-  OpenAI, vLLM, Ollama, LiteLLM and other LLM proxies) or the **Anthropic** API
+- Point it at an **LLM proxy** and it works: it speaks the standard OpenAI chat
+  completions API that proxies and gateways (LiteLLM, OpenRouter, vLLM, Ollama,
+  Azure OpenAI, …) expose. It can also call the **Anthropic** API directly
   (official Go SDK).
 - A bounded **agent loop** with tools: multi-turn sessions, or single tasks
   that end in a validated structured result.
@@ -22,10 +23,11 @@ or build it with Go 1.26+:
 ```sh
 go install github.com/eysteinn/senctl-agent/cmd/senctl-agent@latest   # or download a release binary
 
-export SENCTL_AGENT_PROVIDER=openai
-export SENCTL_AGENT_BASE_URL=https://llm-proxy.example.com/v1
-export SENCTL_AGENT_API_KEY=…            # or OPENAI_API_KEY / ANTHROPIC_API_KEY
-export SENCTL_AGENT_MODEL=my-model       # anthropic defaults to claude-opus-5-5
+export SENCTL_AGENT_BASE_URL=https://llm-proxy.example.com   # with or without /v1
+export SENCTL_AGENT_API_KEY=…            # or OPENAI_API_KEY
+export SENCTL_AGENT_MODEL=my-model       # optional if the proxy serves one model
+
+senctl-agent models                      # what the proxy serves
 
 senctl-agent                             # interactive console
 senctl-agent "why does the build fail?"  # console, starting with that message
@@ -99,17 +101,22 @@ Settings come from flags, then `SENCTL_AGENT_*` environment variables, then a YA
 (`$XDG_CONFIG_HOME/senctl-agent/config.yaml` or `./.senctl-agent.yaml`):
 
 ```yaml
-provider: openai
-base_url: https://llm-proxy.example.com/v1
-model: my-model
+base_url: https://llm-proxy.example.com
+api_key: …
+model: my-model       # optional if the proxy serves one model
 effort: high          # reasoning effort hint
 max_turns: 30         # model calls per prompt
 max_tokens: 16000     # output tokens per model call
 edit: ask             # off | ask | auto
 shell: off            # off | ask | auto
 send_effort: false    # openai: forward effort as reasoning_effort
+provider: openai      # default; anthropic calls the Anthropic API directly
 fallbacks: ""         # anthropic: server-side refusal fallback (default on for the first-party API)
 ```
+
+Only `base_url` and `api_key` are needed for a proxy. If the URL answers 404, `/v1` is
+tried and kept, so either form of the address works. Without a model, the proxy's only
+model is used; if it serves several, the error lists them.
 
 ## Library
 
@@ -120,7 +127,7 @@ import (
     "github.com/eysteinn/senctl-agent/tools"
 )
 
-provider, _ := llm.New(llm.Config{Provider: "openai", BaseURL: proxyURL, APIKey: key})
+provider, _ := llm.New(llm.Config{BaseURL: proxyURL, APIKey: key}) // OpenAI-compatible by default
 conv := provider.NewConversation(llm.Options{Model: "my-model"}, systemPrompt, agent.Specs(myTools...))
 
 // Chat-style: each Send serves tool calls until the model answers in text.

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,7 +19,8 @@ import (
 // gateways).
 type OpenAIConfig struct {
 	APIKey string
-	// BaseURL is the API root, e.g. https://api.openai.com/v1.
+	// BaseURL is the API root, e.g. https://api.openai.com/v1. A root
+	// without /v1 works too: when it answers 404, /v1 is tried and kept.
 	BaseURL string
 	// SendEffort forwards Options.Effort as reasoning_effort. Off by
 	// default because many compatible servers reject unknown fields.
@@ -28,6 +30,10 @@ type OpenAIConfig struct {
 
 type openAIProvider struct {
 	cfg OpenAIConfig
+	mu  sync.Mutex
+	// base is the API root in use; it gains /v1 when the configured root
+	// turns out to need it.
+	base string
 }
 
 // NewOpenAI returns a provider for an OpenAI-compatible endpoint.
@@ -39,7 +45,49 @@ func NewOpenAI(cfg OpenAIConfig) Provider {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Minute}
 	}
-	return &openAIProvider{cfg: cfg}
+	return &openAIProvider{cfg: cfg, base: cfg.BaseURL}
+}
+
+// do sends a request to path under the API root. Proxies differ on whether
+// the root includes /v1, so a 404 from a root without it is retried with
+// /v1, which is then kept for later requests.
+func (p *openAIProvider) do(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+	p.mu.Lock()
+	base := p.base
+	p.mu.Unlock()
+	send := func(base string) (*http.Response, error) {
+		var rd io.Reader
+		if body != nil {
+			rd = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, base+path, rd)
+		if err != nil {
+			return nil, err
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if p.cfg.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
+		}
+		return p.cfg.HTTPClient.Do(req)
+	}
+	res, err := send(base)
+	if err != nil || res.StatusCode != http.StatusNotFound || strings.HasSuffix(base, "/v1") {
+		return res, err
+	}
+	retry, err := send(base + "/v1")
+	if err != nil || retry.StatusCode == http.StatusNotFound {
+		if retry != nil {
+			retry.Body.Close()
+		}
+		return res, nil
+	}
+	res.Body.Close()
+	p.mu.Lock()
+	p.base = base + "/v1"
+	p.mu.Unlock()
+	return retry, nil
 }
 
 func (p *openAIProvider) Name() string { return "openai" }
@@ -56,7 +104,7 @@ type oaFunction struct {
 }
 
 func (p *openAIProvider) NewConversation(opts Options, system string, tools []ToolSpec) Conversation {
-	c := &openAIConversation{cfg: p.cfg, opts: opts}
+	c := &openAIConversation{p: p, cfg: p.cfg, opts: opts}
 	sys, _ := json.Marshal(map[string]string{"role": "system", "content": system})
 	c.messages = append(c.messages, sys)
 	c.SetTools(tools)
@@ -78,14 +126,7 @@ func (c *openAIConversation) SetTools(tools []ToolSpec) {
 
 // ListModels returns the ids from the endpoint's /models listing.
 func (p *openAIProvider) ListModels(ctx context.Context) ([]string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.cfg.BaseURL+"/models", nil)
-	if err != nil {
-		return nil, err
-	}
-	if p.cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
-	}
-	res, err := p.cfg.HTTPClient.Do(req)
+	res, err := p.do(ctx, http.MethodGet, "/models", nil)
 	if err != nil {
 		return nil, fmt.Errorf("openai: list models: %w", err)
 	}
@@ -111,6 +152,7 @@ func (p *openAIProvider) ListModels(ctx context.Context) ([]string, error) {
 }
 
 type openAIConversation struct {
+	p    *openAIProvider
 	cfg  OpenAIConfig
 	opts Options
 	// messages holds the history as raw JSON so assistant messages go back
@@ -181,15 +223,7 @@ func (c *openAIConversation) post(ctx context.Context, stream bool) (*http.Respo
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/chat/completions", bytes.NewReader(buf))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
-	}
-	res, err := c.cfg.HTTPClient.Do(req)
+	res, err := c.p.do(ctx, http.MethodPost, "/chat/completions", buf)
 	if err != nil {
 		return nil, fmt.Errorf("openai: %w", err)
 	}
