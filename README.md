@@ -14,6 +14,10 @@ A small Go harness for tool-using LLM agents, usable as a **library** or as a
 
 ## Command line
 
+Download a binary for Linux, macOS or Windows (amd64 / arm64) from the
+[releases page](https://github.com/eysteinn/senctl-agent/releases) and put it on your `PATH`,
+or build it with Go 1.26+:
+
 ```sh
 go install github.com/eysteinn/senctl-agent/cmd/senctl-agent@latest   # or download a release binary
 
@@ -115,3 +119,10 @@ Packages:
 Each conversation keeps its history in the provider's own wire format, so
 provider-specific content (such as reasoning blocks that must be sent back
 unchanged) survives across turns.
+
+## Releasing
+
+Push a tag like `v0.2.0`. The Release workflow runs GoReleaser (`.goreleaser.yaml`): it runs the
+tests, builds the CLI for Linux, macOS and Windows on amd64 and arm64 with the version stamped
+in (`senctl-agent version`), and publishes archives plus `checksums.txt` as a GitHub release.
+`goreleaser release --snapshot --clean` builds the same archives locally without publishing.
