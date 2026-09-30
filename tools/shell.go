@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,7 +11,9 @@ import (
 	"github.com/eysteinn/senctl-agent/llm"
 )
 
-const maxShellOutput = 30000
+// maxShellOutput bounds what one command's output may hold in memory.
+// Anything too long for the model is left to agent.Config.Spill.
+const maxShellOutput = 16 << 20
 
 // Shell returns a tool that runs shell commands in dir with a timeout. It
 // can change files and reach the network, so only offer it when the user
@@ -46,8 +47,9 @@ func Shell(dir string, timeout time.Duration, approve func(command string) bool)
 			// Background children can hold the pipes open after sh is
 			// killed; stop waiting for them shortly after.
 			cmd.WaitDelay = time.Second
-			var out, errb bytes.Buffer
-			cmd.Stdout, cmd.Stderr = &out, &errb
+			out := &cappedWriter{max: maxShellOutput}
+			errb := &cappedWriter{max: maxShellOutput}
+			cmd.Stdout, cmd.Stderr = out, errb
 			runErr := cmd.Run()
 			code := 0
 			if runErr != nil {
@@ -60,9 +62,9 @@ func Shell(dir string, timeout time.Duration, approve func(command string) bool)
 			if ctx.Err() == context.DeadlineExceeded {
 				return "", fmt.Errorf("command timed out after %s", timeout)
 			}
-			res := fmt.Sprintf("exit code %d\nstdout:\n%s\nstderr:\n%s", code, out.String(), errb.String())
-			if len(res) > maxShellOutput {
-				res = res[:maxShellOutput] + "\n[output cut]"
+			res := fmt.Sprintf("exit code %d\nstdout:\n%s\nstderr:\n%s", code, out.b.String(), errb.b.String())
+			if out.lost+errb.lost > 0 {
+				res += fmt.Sprintf("\n[output stopped at %s per stream; redirect it to a file and search that]", humanBytes(maxShellOutput))
 			}
 			return res, nil
 		},

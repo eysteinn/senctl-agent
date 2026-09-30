@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,7 +25,7 @@ import (
 var Version = "dev"
 
 const defaultSystem = `You are a careful software assistant working in a directory on the user's machine (%s).
-Use the tools provided to look things up instead of guessing; the available tools can change during the conversation. Before changing a file, read it. Keep changes minimal and explain what you changed. Quote the files you rely on, answer concisely, and say when you are unsure.`
+Use the tools provided to look things up instead of guessing; the available tools can change during the conversation. Files can be far larger than you can read at once: for logs and other big files, check the size with file_info, find what matters with grep or pipeline, then read around it. Output too large to show whole is saved to a file you can search the same way. Before changing a file, read it. Keep changes minimal and explain what you changed. Quote the files you rely on, answer concisely, and say when you are unsure.`
 
 // NewRootCmd builds the senctl-agent command tree.
 func NewRootCmd() *cobra.Command {
@@ -67,6 +68,29 @@ type env struct {
 	opts     llm.Options
 	system   string
 	ws       *tools.Workspace
+	// cache holds tool output and input too large for the model's context;
+	// the file tools can read it. close removes it.
+	cache *tools.Cache
+}
+
+func (e *env) close() { _ = e.cache.Close() }
+
+// agentConfig is the agent configuration for a session.
+func (e *env) agentConfig() agent.Config {
+	return agent.Config{MaxTurns: e.cfg.MaxTurns, Spill: e.cache.Spill}
+}
+
+// newCache makes this session's cache directory under the user cache
+// directory, clearing out ones older sessions left behind.
+func newCache() (*tools.Cache, error) {
+	if base, err := os.UserCacheDir(); err == nil {
+		dir := filepath.Join(base, "senctl-agent", "sessions")
+		tools.PruneCaches(dir, 24*time.Hour)
+		if c, err := tools.NewCache(dir); err == nil {
+			return c, nil
+		}
+	}
+	return tools.NewCache("")
 }
 
 func setup(cmd *cobra.Command, v *viper.Viper) (*env, error) {
@@ -82,7 +106,15 @@ func setup(cmd *cobra.Command, v *viper.Viper) (*env, error) {
 	if err != nil {
 		return nil, fmt.Errorf("workspace: %w", err)
 	}
-	e := &env{cfg: cfg, provider: p, opts: opts, ws: ws, system: cfg.System}
+	cache, err := newCache()
+	if err != nil {
+		return nil, fmt.Errorf("cache: %w", err)
+	}
+	if err := ws.AllowRead(cache.Dir()); err != nil {
+		cache.Close()
+		return nil, fmt.Errorf("cache: %w", err)
+	}
+	e := &env{cfg: cfg, provider: p, opts: opts, ws: ws, system: cfg.System, cache: cache}
 	if e.system == "" {
 		e.system = fmt.Sprintf(defaultSystem, ws.Root())
 	}
@@ -175,24 +207,33 @@ so you can run e.g.:
 
   git diff | senctl-agent run "review this change"
 
+Input too large for the model's context (such as a log) is saved to a file
+the model searches with its tools instead:
+
+  journalctl -u myservice | senctl-agent run "why does it keep restarting?"
+
 File editing and shell access are off unless --edit / --shell say otherwise.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			prompt := strings.TrimSpace(strings.Join(args, " "))
+			var stdin io.Reader
 			if in, ok := cmd.InOrStdin().(*os.File); ok && !isTerminal(in) {
-				data, err := io.ReadAll(io.LimitReader(in, 4<<20))
-				if err != nil {
-					return err
-				}
-				if s := strings.TrimSpace(string(data)); s != "" {
-					prompt = strings.TrimSpace(prompt + "\n\n<stdin>\n" + s + "\n</stdin>")
-				}
+				stdin = in
 			}
-			if prompt == "" {
+			if prompt == "" && stdin == nil {
 				return fmt.Errorf("give a prompt as an argument or on standard input")
 			}
 			e, err := setup(cmd, v)
 			if err != nil {
 				return err
+			}
+			defer e.close()
+			if stdin != nil {
+				if prompt, err = e.withInput(prompt, stdin); err != nil {
+					return err
+				}
+			}
+			if prompt == "" {
+				return fmt.Errorf("give a prompt as an argument or on standard input")
 			}
 			if e.cfg.Edit == "" {
 				e.cfg.Edit = modeOff
@@ -202,7 +243,7 @@ File editing and shell access are off unless --edit / --shell say otherwise.`,
 				return err
 			}
 			conv := e.provider.NewConversation(e.opts, e.system, agent.Specs(ts...))
-			s := agent.NewSession(conv, ts, agent.Config{MaxTurns: e.cfg.MaxTurns}, recorder(cmd.ErrOrStderr(), verbose))
+			s := agent.NewSession(conv, ts, e.agentConfig(), recorder(cmd.ErrOrStderr(), verbose))
 			out := cmd.OutOrStdout()
 			streamed := false
 			if !jsonOut && isTerminal(out) {
@@ -246,6 +287,7 @@ func runConsole(cmd *cobra.Command, v *viper.Viper, initial string) error {
 	if err != nil {
 		return err
 	}
+	defer e.close()
 	c := &console{env: e, opts: e.opts, shell: orDefault(e.cfg.Shell, modeOff), edit: orDefault(e.cfg.Edit, modeAsk)}
 	out := cmd.OutOrStdout()
 	interactive := isTerminal(cmd.InOrStdin()) && isTerminal(out)

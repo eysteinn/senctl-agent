@@ -219,7 +219,7 @@ func (c *console) endStream() {
 func (c *console) newSession() {
 	conv := c.env.provider.NewConversation(c.opts, c.env.system, nil)
 	ts := c.tools()
-	c.session = agent.NewSession(conv, ts, agent.Config{MaxTurns: c.env.cfg.MaxTurns}, c.recorder())
+	c.session = agent.NewSession(conv, ts, c.env.agentConfig(), c.recorder())
 	c.session.SetTools(ts)
 	c.session.Stream(func(d string) {
 		if !c.streamed {
@@ -387,7 +387,7 @@ func (c *console) send(ctx context.Context, text string) {
 
 	c.history = append(c.history, turnRecord{"You", text})
 	c.streamed = false
-	answer, err := c.session.Send(ctx, text)
+	answer, err := c.session.Send(ctx, c.env.attachMentions(ctx, text))
 	streamed := c.streamed
 	c.endStream()
 	switch {

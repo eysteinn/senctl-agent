@@ -10,7 +10,8 @@ A small Go harness for tool-using LLM agents, usable as a **library** or as a
   that end in a validated structured result.
 - **Evidence checks** to verify that text an agent quotes really appears in what
   it read.
-- Ready-made **workspace tools** (read-only files, optional shell).
+- Ready-made **workspace tools** (read-only files, optional shell) that cope with
+  files far larger than a model's context, such as multi-gigabyte logs.
 
 ## Command line
 
@@ -30,6 +31,7 @@ senctl-agent                             # interactive console
 senctl-agent "why does the build fail?"  # console, starting with that message
 senctl-agent run "where is the HTTP server started?"   # one-shot answer
 git diff | senctl-agent run "review this change"
+journalctl -u api | senctl-agent run "why does it restart?"  # large input is searched, not pasted
 senctl-agent config                      # effective settings, key masked
 ```
 
@@ -38,7 +40,8 @@ senctl-agent config                      # effective settings, key masked
 Replies stream as they are generated; tool use shows as `⏺ tool args` lines. Line editing,
 history (`$XDG_STATE_HOME/senctl-agent/history`) and Tab completion of commands work as in
 a shell. End a line with `\` to continue on the next one. Ctrl+C cancels the current reply
-(press it twice at an empty prompt to quit), Ctrl+D quits.
+(press it twice at an empty prompt to quit), Ctrl+D quits. Mention a file as `@path` to attach
+it: small text files are included, larger ones are described so the model can search them.
 
 | Command | |
 |---|---|
@@ -57,9 +60,31 @@ a shell. End a line with `\` to continue on the next one. Ctrl+C cancels the cur
 ### Tools and permissions
 
 The model always has read-only file tools under `--dir` (default: the current directory):
-`read_file`, `list_dir`, `glob`, `grep`. With `--edit` it can also `write_file` and
-`edit_file` (exact-text replacement); with `--shell` it can run `shell` commands. Paths can
-never leave the workspace, including through symlinks.
+`read_file`, `file_info`, `list_dir`, `glob`, `grep` and `pipeline`. With `--edit` it can also
+`write_file` and `edit_file` (exact-text replacement); with `--shell` it can run `shell`
+commands. Paths can never leave the workspace, including through symlinks.
+
+### Large files and output
+
+Nothing is ever read whole into the model's context:
+
+- `read_file` pages through a file (2000 lines or ~32 KB per call, long lines cut) and says
+  where the next page starts; a negative `offset` reads from the end (`-100` = last 100 lines).
+  A line index built on first use makes any page of a multi-gigabyte file instant.
+- `file_info` gives size, line count, longest line and the first and last lines, so the model
+  can decide how to approach a file before reading it.
+- `grep` streams through files of any size, with `content` / `files` / `count` modes, context
+  lines, paging (`offset`, `limit`) and totals. Lines that cannot match are skipped cheaply.
+- `pipeline` runs a read-only text pipeline over one file, e.g.
+  `grep -i error | cut -d' ' -f3 | sort | uniq -c | sort -rn | head`. It can use `grep`, `head`,
+  `tail`, `wc`, `sort`, `uniq`, `cut`, `tr`, `nl`, `tac` and `jq` when installed, with the file on
+  standard input. Redirection, variables, globbing, file arguments and options that read or
+  write files are refused, and commands run with a minimal environment in an empty directory.
+- `.gz` files are decompressed by all of these.
+- Tool output too long for the context (over 40 KB) is saved in full to a session cache
+  directory (`$XDG_CACHE_HOME/senctl-agent/sessions/…`, removed on exit). The model sees the
+  first and last lines plus the file's path, and searches it with the same tools. So does
+  large piped input to `run`.
 
 | Setting | Console default | `run` default |
 |---|---|---|
@@ -92,6 +117,7 @@ fallbacks: ""         # anthropic: server-side refusal fallback (default on for 
 import (
     "github.com/eysteinn/senctl-agent/agent"
     "github.com/eysteinn/senctl-agent/llm"
+    "github.com/eysteinn/senctl-agent/tools"
 )
 
 provider, _ := llm.New(llm.Config{Provider: "openai", BaseURL: proxyURL, APIKey: key})
@@ -103,6 +129,13 @@ session.Stream(func(text string) { fmt.Print(text) }) // optional live output
 answer, err := session.Send(ctx, "…")
 session.SetOptions(llm.Options{Model: "other-model"}) // switch model mid-conversation
 
+// Keep oversized tool output out of the context: save it and let the tools read it.
+cache, _ := tools.NewCache("")
+defer cache.Close()
+ws, _ := tools.NewWorkspace(dir)
+ws.AllowRead(cache.Dir())
+session = agent.NewSession(conv, ws.Tools(), agent.Config{Spill: cache.Spill}, nil)
+
 // Task-style: runs until the model calls `submit` with input it accepts.
 result, usage, err := agent.Run(ctx, conv, prompt, myTools, submit, agent.Config{}, recorder)
 ```
@@ -112,9 +145,9 @@ Packages:
 | Package | What it is |
 |---|---|
 | `llm` | `Provider` / `Conversation` interface, Anthropic and OpenAI-compatible adapters, `New(Config)`; optional `Streamer`, `Configurable`, `ModelLister` |
-| `agent` | `Session` and `Run`, tool definitions, event recording, turn and output limits |
+| `agent` | `Session` and `Run`, tool definitions, event recording, turn and output limits, spilling oversized tool output (`Config.Spill`) |
 | `evidence` | Verbatim-quote checking against the text an agent was shown |
-| `tools` | Workspace file tools (read-only, plus write/edit with an approval hook) and an opt-in shell tool |
+| `tools` | Workspace file tools for files of any size (read-only, plus write/edit with an approval hook), the read-only `pipeline` tool, a `Cache` for oversized output, and an opt-in shell tool |
 
 Each conversation keeps its history in the provider's own wire format, so
 provider-specific content (such as reasoning blocks that must be sent back
