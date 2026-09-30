@@ -3,10 +3,10 @@
 A small Go harness for tool-using LLM agents, usable as a **library** or as a
 **command-line tool**.
 
-- Point it at an **LLM proxy** and it works: it speaks the standard OpenAI chat
-  completions API that proxies and gateways (LiteLLM, OpenRouter, vLLM, Ollama,
-  Azure OpenAI, …) expose. It can also call the **Anthropic** API directly
-  (official Go SDK).
+- Point it at an **LLM proxy** and it works: it speaks the OpenAI **Responses API**
+  (`/v1/responses`), which OpenAI and proxies such as LiteLLM serve, so reasoning
+  models keep their reasoning across tool calls. It can also call the **Anthropic**
+  API directly (official Go SDK).
 - A bounded **agent loop** with tools: multi-turn sessions, or single tasks
   that end in a validated structured result.
 - **Evidence checks** to verify that text an agent quotes really appears in what
@@ -109,7 +109,6 @@ max_turns: 30         # model calls per prompt
 max_tokens: 16000     # output tokens per model call
 edit: ask             # off | ask | auto
 shell: off            # off | ask | auto
-send_effort: false    # openai: forward effort as reasoning_effort
 provider: openai      # default; anthropic calls the Anthropic API directly
 fallbacks: ""         # anthropic: server-side refusal fallback (default on for the first-party API)
 ```
@@ -127,7 +126,7 @@ import (
     "github.com/eysteinn/senctl-agent/tools"
 )
 
-provider, _ := llm.New(llm.Config{BaseURL: proxyURL, APIKey: key}) // OpenAI-compatible by default
+provider, _ := llm.New(llm.Config{BaseURL: proxyURL, APIKey: key}) // OpenAI Responses API by default
 conv := provider.NewConversation(llm.Options{Model: "my-model"}, systemPrompt, agent.Specs(myTools...))
 
 // Chat-style: each Send serves tool calls until the model answers in text.
@@ -151,7 +150,7 @@ Packages:
 
 | Package | What it is |
 |---|---|
-| `llm` | `Provider` / `Conversation` interface, Anthropic and OpenAI-compatible adapters, `New(Config)`; optional `Streamer`, `Configurable`, `ModelLister` |
+| `llm` | `Provider` / `Conversation` interface, OpenAI Responses API and Anthropic adapters, `New(Config)`; optional `Streamer`, `Configurable`, `ModelLister` |
 | `agent` | `Session` and `Run`, tool definitions, event recording, turn and output limits, spilling oversized tool output (`Config.Spill`) |
 | `evidence` | Verbatim-quote checking against the text an agent was shown |
 | `tools` | Workspace file tools for files of any size (read-only, plus write/edit with an approval hook), the read-only `pipeline` tool, a `Cache` for oversized output, and an opt-in shell tool |

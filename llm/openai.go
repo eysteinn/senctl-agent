@@ -15,16 +15,13 @@ import (
 )
 
 // OpenAIConfig configures a provider for any endpoint that speaks the
-// OpenAI chat completions API (OpenAI, Azure OpenAI, vLLM, Ollama, LLM
-// gateways).
+// OpenAI Responses API (/v1/responses): OpenAI itself and LLM proxies and
+// gateways such as LiteLLM.
 type OpenAIConfig struct {
 	APIKey string
 	// BaseURL is the API root, e.g. https://api.openai.com/v1. A root
 	// without /v1 works too: when it answers 404, /v1 is tried and kept.
-	BaseURL string
-	// SendEffort forwards Options.Effort as reasoning_effort. Off by
-	// default because many compatible servers reject unknown fields.
-	SendEffort bool
+	BaseURL    string
 	HTTPClient *http.Client
 }
 
@@ -36,7 +33,7 @@ type openAIProvider struct {
 	base string
 }
 
-// NewOpenAI returns a provider for an OpenAI-compatible endpoint.
+// NewOpenAI returns a provider for a Responses API endpoint.
 func NewOpenAI(cfg OpenAIConfig) Provider {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://api.openai.com/v1"
@@ -48,9 +45,12 @@ func NewOpenAI(cfg OpenAIConfig) Provider {
 	return &openAIProvider{cfg: cfg, base: cfg.BaseURL}
 }
 
+func (p *openAIProvider) Name() string { return "openai" }
+
 // do sends a request to path under the API root. Proxies differ on whether
-// the root includes /v1, so a 404 from a root without it is retried with
-// /v1, which is then kept for later requests.
+// the root includes /v1, so a 404 for the path itself (not an API error
+// such as an unknown model) from a root without /v1 is retried with /v1,
+// which is then kept for later requests.
 func (p *openAIProvider) do(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
 	p.mu.Lock()
 	base := p.base
@@ -76,6 +76,12 @@ func (p *openAIProvider) do(ctx context.Context, method, path string, body []byt
 	if err != nil || res.StatusCode != http.StatusNotFound || strings.HasSuffix(base, "/v1") {
 		return res, err
 	}
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	res.Body.Close()
+	res.Body = io.NopCloser(bytes.NewReader(raw))
+	if apiError(raw) != "" {
+		return res, nil
+	}
 	retry, err := send(base + "/v1")
 	if err != nil || retry.StatusCode == http.StatusNotFound {
 		if retry != nil {
@@ -83,45 +89,23 @@ func (p *openAIProvider) do(ctx context.Context, method, path string, body []byt
 		}
 		return res, nil
 	}
-	res.Body.Close()
 	p.mu.Lock()
 	p.base = base + "/v1"
 	p.mu.Unlock()
 	return retry, nil
 }
 
-func (p *openAIProvider) Name() string { return "openai" }
-
-type oaTool struct {
-	Type     string     `json:"type"`
-	Function oaFunction `json:"function"`
-}
-
-type oaFunction struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	Parameters  map[string]any `json:"parameters"`
-}
-
-func (p *openAIProvider) NewConversation(opts Options, system string, tools []ToolSpec) Conversation {
-	c := &openAIConversation{p: p, cfg: p.cfg, opts: opts}
-	sys, _ := json.Marshal(map[string]string{"role": "system", "content": system})
-	c.messages = append(c.messages, sys)
-	c.SetTools(tools)
-	return c
-}
-
-func (c *openAIConversation) SetOptions(opts Options) { c.opts = opts }
-
-func (c *openAIConversation) SetTools(tools []ToolSpec) {
-	c.tools = nil
-	for _, t := range tools {
-		schema := t.Schema
-		if schema == nil {
-			schema = map[string]any{"type": "object", "properties": map[string]any{}}
-		}
-		c.tools = append(c.tools, oaTool{Type: "function", Function: oaFunction{Name: t.Name, Description: t.Description, Parameters: schema}})
+// apiError returns the message of an API error body, or "".
+func apiError(raw []byte) string {
+	var e struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
+	if json.Unmarshal(raw, &e) == nil && e.Error != nil {
+		return e.Error.Message
+	}
+	return ""
 }
 
 // ListModels returns the ids from the endpoint's /models listing.
@@ -151,89 +135,103 @@ func (p *openAIProvider) ListModels(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
+type oaTool struct {
+	Type        string         `json:"type"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters"`
+	// Strict must be off: strict schemas require every property, and tool
+	// inputs here have optional ones.
+	Strict bool `json:"strict"`
+}
+
+func (p *openAIProvider) NewConversation(opts Options, system string, tools []ToolSpec) Conversation {
+	c := &openAIConversation{p: p, opts: opts, system: system}
+	c.SetTools(tools)
+	return c
+}
+
+// openAIConversation keeps the conversation on the client (store: false):
+// every request carries the full history as input items, and the model's
+// output items, including encrypted reasoning, go back unchanged so its
+// reasoning carries across tool calls.
 type openAIConversation struct {
-	p    *openAIProvider
-	cfg  OpenAIConfig
-	opts Options
-	// messages holds the history as raw JSON so assistant messages go back
-	// exactly as the server sent them.
-	messages []json.RawMessage
-	tools    []oaTool
+	p      *openAIProvider
+	opts   Options
+	system string
+	items  []json.RawMessage
+	tools  []oaTool
 }
 
-type oaToolCall struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	} `json:"function"`
-}
+func (c *openAIConversation) SetOptions(opts Options) { c.opts = opts }
 
-type oaResponse struct {
-	Choices []struct {
-		Message      json.RawMessage `json:"message"`
-		FinishReason string          `json:"finish_reason"`
-	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int64 `json:"prompt_tokens"`
-		CompletionTokens int64 `json:"completion_tokens"`
-	} `json:"usage"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
-// addUser appends tool results and the user's text; it returns how many
-// messages were added so a failed request can take them back.
-func (c *openAIConversation) addUser(text string, results []ToolResult) int {
-	n := len(c.messages)
-	for _, r := range results {
-		content := r.Content
-		if r.IsError {
-			content = "ERROR: " + content
+func (c *openAIConversation) SetTools(tools []ToolSpec) {
+	c.tools = nil
+	for _, t := range tools {
+		schema := t.Schema
+		if schema == nil {
+			schema = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
-		m, _ := json.Marshal(map[string]string{"role": "tool", "tool_call_id": r.CallID, "content": content})
-		c.messages = append(c.messages, m)
+		c.tools = append(c.tools, oaTool{Type: "function", Name: t.Name, Description: t.Description, Parameters: schema})
+	}
+}
+
+// addUser appends tool results and text as input items, returning how many
+// were added so a failed request can take them back.
+func (c *openAIConversation) addUser(text string, results []ToolResult) int {
+	n := len(c.items)
+	for _, r := range results {
+		out := r.Content
+		if r.IsError {
+			out = "ERROR: " + out
+		}
+		m, _ := json.Marshal(map[string]string{"type": "function_call_output", "call_id": r.CallID, "output": out})
+		c.items = append(c.items, m)
 	}
 	if strings.TrimSpace(text) != "" {
 		m, _ := json.Marshal(map[string]string{"role": "user", "content": text})
-		c.messages = append(c.messages, m)
+		c.items = append(c.items, m)
 	}
-	return len(c.messages) - n
+	return len(c.items) - n
 }
 
 func (c *openAIConversation) post(ctx context.Context, stream bool) (*http.Response, error) {
-	body := map[string]any{"model": c.opts.Model, "messages": c.messages}
+	body := map[string]any{
+		"model":   c.opts.Model,
+		"input":   c.items,
+		"store":   false,
+		"include": []string{"reasoning.encrypted_content"},
+	}
+	if c.system != "" {
+		body["instructions"] = c.system
+	}
 	if len(c.tools) > 0 {
 		body["tools"] = c.tools
 		body["tool_choice"] = "auto"
 	}
 	if c.opts.MaxTokens > 0 {
-		body["max_completion_tokens"] = c.opts.MaxTokens
+		body["max_output_tokens"] = c.opts.MaxTokens
 	}
-	if c.cfg.SendEffort && c.opts.Effort != "" {
-		body["reasoning_effort"] = c.opts.Effort
+	if c.opts.Effort != "" {
+		body["reasoning"] = map[string]string{"effort": c.opts.Effort}
 	}
 	if stream {
 		body["stream"] = true
-		body["stream_options"] = map[string]any{"include_usage": true}
 	}
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	res, err := c.p.do(ctx, http.MethodPost, "/chat/completions", buf)
+	res, err := c.p.do(ctx, http.MethodPost, "/responses", buf)
 	if err != nil {
 		return nil, fmt.Errorf("openai: %w", err)
 	}
 	if res.StatusCode >= 300 {
 		defer res.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		msg := snippet(raw)
-		var e oaResponse
-		if json.Unmarshal(raw, &e) == nil && e.Error != nil {
-			msg = e.Error.Message
+		msg := apiError(raw)
+		if msg == "" {
+			msg = snippet(raw)
 		}
 		return nil, fmt.Errorf("openai: HTTP %d: %s", res.StatusCode, msg)
 	}
@@ -241,191 +239,148 @@ func (c *openAIConversation) post(ctx context.Context, stream bool) (*http.Respo
 }
 
 func (c *openAIConversation) Send(ctx context.Context, text string, results []ToolResult) (*Turn, error) {
-	added := c.addUser(text, results)
-	turn, err := c.send(ctx)
-	if err != nil && turn == nil {
-		c.messages = c.messages[:len(c.messages)-added]
-	}
-	return turn, err
-}
-
-func (c *openAIConversation) send(ctx context.Context) (*Turn, error) {
-	res, err := c.post(ctx, false)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	return c.decode(res)
-}
-
-// decode handles a complete (non-streamed) chat completion response.
-func (c *openAIConversation) decode(res *http.Response) (*Turn, error) {
-	raw, err := io.ReadAll(io.LimitReader(res.Body, 32<<20))
-	if err != nil {
-		return nil, fmt.Errorf("openai: read response: %w", err)
-	}
-	var out oaResponse
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("openai: decode response: %s", snippet(raw))
-	}
-	if out.Error != nil {
-		return nil, fmt.Errorf("openai: %s", out.Error.Message)
-	}
-	if len(out.Choices) == 0 {
-		return nil, fmt.Errorf("openai: response has no choices")
-	}
-	choice := out.Choices[0]
-	var msg oaMessage
-	if err := json.Unmarshal(choice.Message, &msg); err != nil {
-		return nil, fmt.Errorf("openai: decode message: %w", err)
-	}
-	return c.finish(choice.Message, msg, choice.FinishReason, Usage{InputTokens: out.Usage.PromptTokens, OutputTokens: out.Usage.CompletionTokens})
-}
-
-type oaMessage struct {
-	Content   *string      `json:"content"`
-	Refusal   *string      `json:"refusal"`
-	ToolCalls []oaToolCall `json:"tool_calls"`
-}
-
-// finish records the assistant message and turns it into a Turn.
-func (c *openAIConversation) finish(raw json.RawMessage, msg oaMessage, finishReason string, usage Usage) (*Turn, error) {
-	c.messages = append(c.messages, raw)
-	turn := &Turn{Usage: usage}
-	if msg.Refusal != nil && *msg.Refusal != "" || finishReason == "content_filter" {
-		return turn, ErrRefused
-	}
-	turn.Truncated = finishReason == "length"
-	if msg.Content != nil {
-		turn.Text = *msg.Content
-	}
-	for _, tc := range msg.ToolCalls {
-		// Invalid JSON is passed through; the caller reports it back to the
-		// model as a tool error so it can retry.
-		turn.ToolCalls = append(turn.ToolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Input: json.RawMessage(tc.Function.Arguments)})
-	}
-	return turn, nil
+	return c.SendStream(ctx, text, results, nil)
 }
 
 // SendStream is Send over server-sent events, delivering text to onText as
-// it arrives and assembling tool calls from their streamed fragments.
+// it arrives. With onText nil the response comes in one piece.
 func (c *openAIConversation) SendStream(ctx context.Context, text string, results []ToolResult, onText func(string)) (*Turn, error) {
 	added := c.addUser(text, results)
-	turn, err := c.sendStream(ctx, onText)
+	turn, err := c.exchange(ctx, onText)
 	if err != nil && turn == nil {
-		c.messages = c.messages[:len(c.messages)-added]
+		c.items = c.items[:len(c.items)-added]
 	}
 	return turn, err
 }
 
-func (c *openAIConversation) sendStream(ctx context.Context, onText func(string)) (*Turn, error) {
-	res, err := c.post(ctx, true)
+func (c *openAIConversation) exchange(ctx context.Context, onText func(string)) (*Turn, error) {
+	res, err := c.post(ctx, onText != nil)
 	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
 	if !strings.Contains(res.Header.Get("Content-Type"), "text/event-stream") {
-		// Some compatible servers ignore stream=true and answer in one piece.
-		turn, err := c.decode(res)
+		// Also taken when a server ignores stream=true.
+		raw, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
+		if err != nil {
+			return nil, fmt.Errorf("openai: read response: %w", err)
+		}
+		var r oaResponse
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return nil, fmt.Errorf("openai: decode response: %s", snippet(raw))
+		}
+		turn, err := c.finish(&r)
 		if err == nil && onText != nil && turn.Text != "" {
 			onText(turn.Text)
 		}
 		return turn, err
 	}
-	var content, refusal strings.Builder
-	var calls []oaToolCall
-	var finish string
-	var usage Usage
 	sc := bufio.NewScanner(res.Body)
-	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	// The final event carries the whole response, encrypted reasoning
+	// included.
+	sc.Buffer(make([]byte, 64<<10), 64<<20)
 	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "data:") {
+		data, ok := strings.CutPrefix(sc.Text(), "data:")
+		if !ok {
 			continue
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			break
+		var ev struct {
+			Type     string      `json:"type"`
+			Delta    string      `json:"delta"`
+			Message  string      `json:"message"`
+			Response *oaResponse `json:"response"`
 		}
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content   *string `json:"content"`
-					Refusal   *string `json:"refusal"`
-					ToolCalls []struct {
-						Index    int    `json:"index"`
-						ID       string `json:"id"`
-						Type     string `json:"type"`
-						Function struct {
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
-						} `json:"function"`
-					} `json:"tool_calls"`
-				} `json:"delta"`
-				FinishReason *string `json:"finish_reason"`
-			} `json:"choices"`
-			Usage *struct {
-				PromptTokens     int64 `json:"prompt_tokens"`
-				CompletionTokens int64 `json:"completion_tokens"`
-			} `json:"usage"`
-			Error *struct {
-				Message string `json:"message"`
-			} `json:"error"`
+		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &ev); err != nil {
+			return nil, fmt.Errorf("openai: decode stream event: %s", snippet([]byte(data)))
 		}
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			return nil, fmt.Errorf("openai: decode stream chunk: %s", snippet([]byte(data)))
-		}
-		if chunk.Error != nil {
-			return nil, fmt.Errorf("openai: %s", chunk.Error.Message)
-		}
-		if chunk.Usage != nil {
-			usage = Usage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}
-		}
-		for _, ch := range chunk.Choices {
-			if d := ch.Delta.Content; d != nil && *d != "" {
-				content.WriteString(*d)
-				if onText != nil {
-					onText(*d)
-				}
+		switch ev.Type {
+		case "response.output_text.delta":
+			if onText != nil && ev.Delta != "" {
+				onText(ev.Delta)
 			}
-			if d := ch.Delta.Refusal; d != nil {
-				refusal.WriteString(*d)
+		case "response.completed", "response.incomplete", "response.failed":
+			if ev.Response == nil {
+				return nil, fmt.Errorf("openai: %s event without a response", ev.Type)
 			}
-			for _, tc := range ch.Delta.ToolCalls {
-				for len(calls) <= tc.Index {
-					calls = append(calls, oaToolCall{Type: "function"})
-				}
-				call := &calls[tc.Index]
-				if tc.ID != "" {
-					call.ID = tc.ID
-				}
-				call.Function.Name += tc.Function.Name
-				call.Function.Arguments += tc.Function.Arguments
-			}
-			if ch.FinishReason != nil {
-				finish = *ch.FinishReason
-			}
+			return c.finish(ev.Response)
+		case "error":
+			return nil, fmt.Errorf("openai: %s", ev.Message)
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("openai: read stream: %w", err)
 	}
-	msg := oaMessage{ToolCalls: calls}
-	assistant := map[string]any{"role": "assistant", "content": nil}
-	if content.Len() > 0 {
-		s := content.String()
-		msg.Content = &s
-		assistant["content"] = s
+	return nil, fmt.Errorf("openai: the stream ended before the response was complete")
+}
+
+type oaResponse struct {
+	Status            string `json:"status"`
+	IncompleteDetails *struct {
+		Reason string `json:"reason"`
+	} `json:"incomplete_details"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+	Output []json.RawMessage `json:"output"`
+	Usage  struct {
+		InputTokens  int64 `json:"input_tokens"`
+		OutputTokens int64 `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+// finish records the output items and turns them into a Turn.
+func (c *openAIConversation) finish(r *oaResponse) (*Turn, error) {
+	if r.Status == "failed" || r.Error != nil && r.Error.Message != "" {
+		msg := "the response failed"
+		if r.Error != nil && r.Error.Message != "" {
+			msg = r.Error.Message
+		}
+		return nil, fmt.Errorf("openai: %s", msg)
 	}
-	if refusal.Len() > 0 {
-		r := refusal.String()
-		msg.Refusal = &r
+	c.items = append(c.items, r.Output...)
+	turn := &Turn{Usage: Usage{InputTokens: r.Usage.InputTokens, OutputTokens: r.Usage.OutputTokens}}
+	if r.Status == "incomplete" && r.IncompleteDetails != nil {
+		switch r.IncompleteDetails.Reason {
+		case "content_filter":
+			return turn, ErrRefused
+		case "max_output_tokens":
+			turn.Truncated = true
+		}
 	}
-	if len(calls) > 0 {
-		assistant["tool_calls"] = calls
+	var texts []string
+	for _, raw := range r.Output {
+		var item struct {
+			Type      string `json:"type"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+			Content   []struct {
+				Type    string `json:"type"`
+				Text    string `json:"text"`
+				Refusal string `json:"refusal"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return nil, fmt.Errorf("openai: decode output item: %s", snippet(raw))
+		}
+		switch item.Type {
+		case "message":
+			for _, part := range item.Content {
+				switch part.Type {
+				case "output_text":
+					texts = append(texts, part.Text)
+				case "refusal":
+					return turn, ErrRefused
+				}
+			}
+		case "function_call":
+			// Invalid JSON is passed through; the caller reports it back to
+			// the model as a tool error so it can retry.
+			turn.ToolCalls = append(turn.ToolCalls, ToolCall{ID: item.CallID, Name: item.Name, Input: json.RawMessage(item.Arguments)})
+		}
 	}
-	raw, _ := json.Marshal(assistant)
-	return c.finish(raw, msg, finish, usage)
+	turn.Text = strings.Join(texts, "\n")
+	return turn, nil
 }
 
 func snippet(b []byte) string {

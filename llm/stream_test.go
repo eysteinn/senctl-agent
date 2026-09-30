@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -41,25 +42,34 @@ func (s *sse) server(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func openAIChunks(chunks ...string) string {
+func openAIEvents(events ...string) string {
 	var b strings.Builder
-	for _, c := range chunks {
-		fmt.Fprintf(&b, "data: %s\n\n", c)
+	for _, e := range events {
+		var probe struct{ Type string }
+		_ = json.Unmarshal([]byte(e), &probe)
+		var one bytes.Buffer
+		_ = json.Compact(&one, []byte(e))
+		fmt.Fprintf(&b, "event: %s\ndata: %s\n\n", probe.Type, one.String())
 	}
-	b.WriteString("data: [DONE]\n\n")
 	return b.String()
 }
 
 func TestOpenAIStream(t *testing.T) {
 	s := &sse{bodies: []string{
-		openAIChunks(
-			`{"choices":[{"delta":{"role":"assistant","content":"Hel"}}]}`,
-			`{"choices":[{"delta":{"content":"lo"}}]}`,
-			`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"lookup","arguments":"{\"q\""}}]}}]}`,
-			`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"x\"}"}}]},"finish_reason":"tool_calls"}]}`,
-			`{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3}}`,
+		openAIEvents(
+			`{"type":"response.created","response":{"status":"in_progress","output":[]}}`,
+			`{"type":"response.output_text.delta","delta":"Hel"}`,
+			`{"type":"response.output_text.delta","delta":"lo"}`,
+			`{"type":"response.function_call_arguments.delta","delta":"{\"q\""}`,
+			`{"type":"response.completed","response":{"status":"completed","output":[
+			  {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]},
+			  {"type":"function_call","call_id":"c1","name":"lookup","arguments":"{\"q\":\"x\"}"}],
+			  "usage":{"input_tokens":11,"output_tokens":3}}}`,
 		),
-		openAIChunks(`{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`),
+		openAIEvents(`{"type":"response.output_text.delta","delta":"done"}`,
+			`{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}}`),
+		openAIEvents(`{"type":"error","message":"rate limited"}`),
+		openAIEvents(`{"type":"response.output_text.delta","delta":"cut"}`),
 	}}
 	srv := s.server(t)
 	p := NewOpenAI(OpenAIConfig{BaseURL: srv.URL})
@@ -75,18 +85,23 @@ func TestOpenAIStream(t *testing.T) {
 	if len(turn.ToolCalls) != 1 || turn.ToolCalls[0].ID != "c1" || string(turn.ToolCalls[0].Input) != `{"q":"x"}` {
 		t.Fatalf("tool calls = %+v", turn.ToolCalls)
 	}
-	if s.requests[0]["stream"] != true {
-		t.Fatalf("stream not requested: %v", s.requests[0])
+	if s.requests[0]["stream"] != true || s.paths[0] != "POST /responses" {
+		t.Fatalf("request = %v %v", s.paths[0], s.requests[0])
 	}
 
 	conv.(Configurable).SetOptions(Options{Model: "m2"})
-	if _, err := conv.(Streamer).SendStream(context.Background(), "", []ToolResult{{CallID: "c1", Content: "r"}}, nil); err != nil {
+	if _, err := conv.(Streamer).SendStream(context.Background(), "", []ToolResult{{CallID: "c1", Content: "r"}}, func(string) {}); err != nil {
 		t.Fatal(err)
 	}
-	msgs := s.requests[1]["messages"].([]any)
-	asst := msgs[2].(map[string]any)
-	if s.requests[1]["model"] != "m2" || asst["content"] != "Hello" || len(asst["tool_calls"].([]any)) != 1 || msgs[3].(map[string]any)["role"] != "tool" {
-		t.Fatalf("second request = model %v msgs %v", s.requests[1]["model"], msgs)
+	items := s.requests[1]["input"].([]any)
+	if s.requests[1]["model"] != "m2" || len(items) != 4 || items[1].(map[string]any)["type"] != "message" || items[3].(map[string]any)["output"] != "r" {
+		t.Fatalf("second request = model %v input %v", s.requests[1]["model"], items)
+	}
+	if _, err := conv.(Streamer).SendStream(context.Background(), "x", nil, func(string) {}); err == nil || !strings.Contains(err.Error(), "rate limited") {
+		t.Fatalf("error event: %v", err)
+	}
+	if _, err := conv.(Streamer).SendStream(context.Background(), "y", nil, func(string) {}); err == nil || !strings.Contains(err.Error(), "ended before") {
+		t.Fatalf("cut stream: %v", err)
 	}
 
 	ids, err := p.(ModelLister).ListModels(context.Background())

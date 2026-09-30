@@ -17,19 +17,18 @@ import (
 // Config is the effective CLI configuration: flags override environment
 // (SENCTL_AGENT_*), which overrides the config file.
 type Config struct {
-	Provider   string `mapstructure:"provider"`
-	BaseURL    string `mapstructure:"base_url"`
-	APIKey     string `mapstructure:"api_key"`
-	Model      string `mapstructure:"model"`
-	Effort     string `mapstructure:"effort"`
-	MaxTurns   int    `mapstructure:"max_turns"`
-	MaxTokens  int64  `mapstructure:"max_tokens"`
-	Fallbacks  string `mapstructure:"fallbacks"`
-	SendEffort bool   `mapstructure:"send_effort"`
-	System     string `mapstructure:"system"`
-	Dir        string `mapstructure:"dir"`
-	Shell      string `mapstructure:"shell"`
-	Edit       string `mapstructure:"edit"`
+	Provider  string `mapstructure:"provider"`
+	BaseURL   string `mapstructure:"base_url"`
+	APIKey    string `mapstructure:"api_key"`
+	Model     string `mapstructure:"model"`
+	Effort    string `mapstructure:"effort"`
+	MaxTurns  int    `mapstructure:"max_turns"`
+	MaxTokens int64  `mapstructure:"max_tokens"`
+	Fallbacks string `mapstructure:"fallbacks"`
+	System    string `mapstructure:"system"`
+	Dir       string `mapstructure:"dir"`
+	Shell     string `mapstructure:"shell"`
+	Edit      string `mapstructure:"edit"`
 }
 
 // bindFlags declares the persistent flags and wires them, the environment
@@ -37,9 +36,9 @@ type Config struct {
 func bindFlags(cmd *cobra.Command, v *viper.Viper) {
 	f := cmd.PersistentFlags()
 	f.String("config", "", "config file (default $XDG_CONFIG_HOME/senctl-agent/config.yaml, then ./.senctl-agent.yaml)")
-	f.String("base-url", "", "LLM proxy (or any OpenAI-compatible endpoint), e.g. https://llm-proxy.example.com")
+	f.String("base-url", "", "LLM proxy (or any endpoint with the OpenAI Responses API), e.g. https://llm-proxy.example.com")
 	f.String("model", "", "model id (default: the endpoint's only model, if it lists one)")
-	f.String("provider", "", "API to speak: openai (default; the chat completions API proxies use) or anthropic (the Anthropic API directly)")
+	f.String("provider", "", "API to speak: openai (default; the OpenAI Responses API, which proxies serve) or anthropic (the Anthropic API directly)")
 	f.String("effort", "", "reasoning effort: low, medium, high")
 	f.Int("max-turns", 30, "maximum model calls per prompt")
 	f.Int64("max-tokens", 16000, "maximum output tokens per model call")
@@ -53,7 +52,7 @@ func bindFlags(cmd *cobra.Command, v *viper.Viper) {
 	v.SetEnvPrefix("SENCTL_AGENT")
 	v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	v.AutomaticEnv()
-	for _, k := range []string{"api_key", "fallbacks", "send_effort"} {
+	for _, k := range []string{"api_key", "fallbacks"} {
 		_ = v.BindEnv(k)
 	}
 }
@@ -112,7 +111,7 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 // provider builds the configured model provider. Without a model it uses
 // the endpoint's only model, or says which ones there are.
 func (c *Config) provider(ctx context.Context) (llm.Provider, llm.Options, error) {
-	cfg := llm.Config{Provider: c.Provider, APIKey: c.APIKey, BaseURL: c.BaseURL, SendEffort: c.SendEffort}
+	cfg := llm.Config{Provider: c.Provider, APIKey: c.APIKey, BaseURL: c.BaseURL}
 	switch strings.ToLower(c.Fallbacks) {
 	case "true", "1", "yes", "on":
 		t := true

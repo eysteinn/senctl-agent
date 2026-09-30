@@ -1,2 +1,3 @@
 /senctl-agent
 /dist/
+.env
