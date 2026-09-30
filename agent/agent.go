@@ -186,9 +186,10 @@ func Run(ctx context.Context, conv llm.Conversation, prompt string, tools []Tool
 
 // Session is a multi-turn conversation with tools.
 type Session struct {
-	conv  llm.Conversation
-	srv   *server
-	usage llm.Usage
+	conv   llm.Conversation
+	srv    *server
+	usage  llm.Usage
+	onText func(string)
 	// pending holds tool results not yet sent (after an interrupted turn).
 	pending []llm.ToolResult
 }
@@ -201,15 +202,53 @@ func NewSession(conv llm.Conversation, tools []Tool, cfg Config, rec Recorder) *
 // Usage is the total token usage so far.
 func (s *Session) Usage() llm.Usage { return s.usage }
 
+// Stream makes Send deliver the model's text to onText as it is generated,
+// when the conversation supports streaming (llm.Streamer). nil turns it off.
+func (s *Session) Stream(onText func(string)) { s.onText = onText }
+
+// SetOptions changes model options for the following turns. It reports
+// false when the conversation cannot change them (llm.Configurable).
+func (s *Session) SetOptions(opts llm.Options) bool {
+	c, ok := s.conv.(llm.Configurable)
+	if ok {
+		c.SetOptions(opts)
+	}
+	return ok
+}
+
+// SetTools replaces the tools offered to the model for the following turns.
+// It reports false when the conversation cannot change them.
+func (s *Session) SetTools(tools []Tool) bool {
+	c, ok := s.conv.(llm.Configurable)
+	if !ok {
+		return false
+	}
+	c.SetTools(Specs(tools...))
+	s.srv = newServer(tools, s.srv.cfg, s.srv.rec)
+	return true
+}
+
+func (s *Session) send(ctx context.Context, text string, results []llm.ToolResult) (*llm.Turn, error) {
+	if st, ok := s.conv.(llm.Streamer); ok && s.onText != nil {
+		return st.SendStream(ctx, text, results, s.onText)
+	}
+	return s.conv.Send(ctx, text, results)
+}
+
 // Send adds a user message and serves tool calls until the model answers
-// without calling tools, returning that answer.
+// without calling tools, returning that answer. If a request fails midway
+// (including a cancelled context), tool results that were not delivered are
+// kept and sent with the next message, so the conversation stays valid.
 func (s *Session) Send(ctx context.Context, text string) (string, error) {
 	results := s.pending
 	s.pending = nil
 	for turnN := 0; turnN < s.srv.cfg.MaxTurns; turnN++ {
-		turn, err := s.conv.Send(ctx, text, results)
+		turn, err := s.send(ctx, text, results)
 		addUsage(&s.usage, turn)
 		if err != nil {
+			if turn == nil {
+				s.pending = results
+			}
 			return "", err
 		}
 		text, results = "", nil
@@ -219,12 +258,17 @@ func (s *Session) Send(ctx context.Context, text string) (string, error) {
 			}
 			return turn.Text, nil
 		}
-		if strings.TrimSpace(turn.Text) != "" {
+		if strings.TrimSpace(turn.Text) != "" && s.onText == nil {
 			s.srv.rec(ctx, Event{Kind: EventModelText, Content: turn.Text})
 		}
-		for _, call := range turn.ToolCalls {
+		for i, call := range turn.ToolCalls {
 			res, _, err := s.srv.serve(ctx, call, "")
 			if err != nil {
+				// Every call needs an answer before the model can continue.
+				for _, rest := range turn.ToolCalls[i:] {
+					results = append(results, llm.ToolResult{CallID: rest.ID, Content: "cancelled by the user", IsError: true})
+				}
+				s.pending = results
 				return "", err
 			}
 			results = append(results, res)

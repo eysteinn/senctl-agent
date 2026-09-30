@@ -27,6 +27,7 @@ type Config struct {
 	System     string `mapstructure:"system"`
 	Dir        string `mapstructure:"dir"`
 	Shell      string `mapstructure:"shell"`
+	Edit       string `mapstructure:"edit"`
 }
 
 // bindFlags declares the persistent flags and wires them, the environment
@@ -42,8 +43,9 @@ func bindFlags(cmd *cobra.Command, v *viper.Viper) {
 	f.Int64("max-tokens", 16000, "maximum output tokens per model call")
 	f.String("system", "", "system prompt (replaces the default)")
 	f.String("dir", ".", "workspace directory the file tools can read")
-	f.String("shell", "off", "shell tool: off, ask (confirm each command on the terminal) or auto")
-	for _, name := range []string{"provider", "base-url", "model", "effort", "max-turns", "max-tokens", "system", "dir", "shell"} {
+	f.String("shell", "off", "shell tool: off, ask (confirm each command) or auto")
+	f.String("edit", "", "file editing: off, ask (confirm each change) or auto (default: ask in the console, off for run)")
+	for _, name := range []string{"provider", "base-url", "model", "effort", "max-turns", "max-tokens", "system", "dir", "shell", "edit"} {
 		_ = v.BindPFlag(strings.ReplaceAll(name, "-", "_"), f.Lookup(name))
 	}
 	v.SetEnvPrefix("SENCTL_AGENT")
@@ -96,10 +98,12 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 	if c.Model == "" {
 		c.Model = llm.DefaultModel(c.Provider)
 	}
-	switch c.Shell {
-	case "", "off", "ask", "auto":
-	default:
-		return nil, fmt.Errorf("--shell must be off, ask or auto")
+	for name, v := range map[string]string{"shell": c.Shell, "edit": c.Edit} {
+		switch v {
+		case "", "off", "ask", "auto":
+		default:
+			return nil, fmt.Errorf("--%s must be off, ask or auto", name)
+		}
 	}
 	return &c, nil
 }
