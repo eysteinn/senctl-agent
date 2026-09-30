@@ -14,8 +14,8 @@ const (
 // Config selects and configures a provider. It is what a config file or
 // environment maps onto.
 type Config struct {
-	// Provider is "openai" (the default: the OpenAI chat completions API
-	// that LLM proxies and gateways speak) or "anthropic" (the Anthropic
+	// Provider is "openai" (the default: the OpenAI Responses API, which
+	// OpenAI and LLM proxies and gateways serve) or "anthropic" (the Anthropic
 	// Messages API, for talking to it directly).
 	Provider string
 	APIKey   string
@@ -25,15 +25,13 @@ type Config struct {
 	// Fallbacks (anthropic) asks the API to re-serve a declined request on
 	// a fallback model. Nil means on for the first-party API (no BaseURL).
 	Fallbacks *bool
-	// SendEffort (openai) forwards Options.Effort as reasoning_effort.
-	SendEffort bool
 }
 
 // New builds the provider described by cfg.
 func New(cfg Config) (Provider, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
 	case ProviderOpenAI, "":
-		return NewOpenAI(OpenAIConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, SendEffort: cfg.SendEffort}), nil
+		return NewOpenAI(OpenAIConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL}), nil
 	case ProviderAnthropic:
 		fallbacks := cfg.BaseURL == ""
 		if cfg.Fallbacks != nil {
@@ -45,7 +43,7 @@ func New(cfg Config) (Provider, error) {
 }
 
 // DefaultModel is the model used when none is configured, or "" when the
-// provider has no sensible default (an OpenAI-compatible proxy decides
+// provider has no sensible default (a proxy decides
 // which models exist).
 func DefaultModel(provider string) string {
 	if strings.EqualFold(provider, ProviderAnthropic) {

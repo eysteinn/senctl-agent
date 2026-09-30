@@ -34,7 +34,7 @@ func NewRootCmd() *cobra.Command {
 		Use:   "senctl-agent [prompt]",
 		Short: "A tool-using LLM agent for the terminal",
 		Long: `senctl-agent talks to an LLM through an LLM proxy (or any endpoint that speaks
-the standard OpenAI chat completions API). Point it at the proxy with an API key;
+the OpenAI Responses API). Point it at the proxy with an API key;
 the model defaults to the proxy's only model, if it lists one. Run it without
 arguments for an interactive console (/help lists its commands), or with a
 prompt to start the console with that message. Use "senctl-agent run" for

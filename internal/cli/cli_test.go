@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-// fakeProxy is an OpenAI-compatible endpoint. It lists two models; when
+// fakeProxy is a Responses API endpoint. It lists two models; when
 // the conversation has no tool result yet it asks to read notes.txt (or to
 // write hello.txt when asked to create a file), otherwise it answers with
 // the tool result's first line. It streams when asked to.
@@ -47,16 +47,16 @@ func (f *fakeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.requests = append(f.requests, req)
 	f.auth = append(f.auth, r.Header.Get("Authorization"))
 	f.mu.Unlock()
-	msgs := req["messages"].([]any)
-	last := msgs[len(msgs)-1].(map[string]any)
+	items := req["input"].([]any)
+	last := items[len(items)-1].(map[string]any)
 	var text string
-	var calls []any
+	var output []any
 	call := func(name, args string) {
-		calls = append(calls, map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": name, "arguments": args}})
+		output = append(output, map[string]any{"type": "function_call", "id": "fc1", "call_id": "c1", "name": name, "arguments": args})
 	}
 	switch {
-	case last["role"] == "tool":
-		text = "The tool says: " + strings.SplitN(last["content"].(string), "\n", 2)[0]
+	case last["type"] == "function_call_output":
+		text = "The tool says: " + strings.SplitN(last["output"].(string), "\n", 2)[0]
 	case strings.Contains(last["content"].(string), "notes"):
 		call("read_file", `{"path":"notes.txt"}`)
 	case strings.Contains(last["content"].(string), "create"):
@@ -64,31 +64,26 @@ func (f *fakeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		text = "You said: " + last["content"].(string)
 	}
+	if text != "" {
+		output = append([]any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text}}}}, output...)
+	}
+	resp := map[string]any{"status": "completed", "output": output, "usage": map[string]any{"input_tokens": 10, "output_tokens": 2}}
 	if req["stream"] == true {
 		w.Header().Set("Content-Type", "text/event-stream")
-		send := func(v any) { b, _ := json.Marshal(v); fmt.Fprintf(w, "data: %s\n\n", b) }
+		send := func(v map[string]any) {
+			b, _ := json.Marshal(v)
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", v["type"], b)
+		}
 		if text != "" {
 			half := len(text) / 2
-			send(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": text[:half]}}}})
-			send(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": text[half:]}}}})
+			send(map[string]any{"type": "response.output_text.delta", "delta": text[:half]})
+			send(map[string]any{"type": "response.output_text.delta", "delta": text[half:]})
 		}
-		for i, c := range calls {
-			c.(map[string]any)["index"] = i
-			send(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"tool_calls": []any{c}}}}})
-		}
-		send(map[string]any{"choices": []any{}, "usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 2}})
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		send(map[string]any{"type": "response.completed", "response": resp})
 		return
 	}
-	msg := map[string]any{"role": "assistant", "content": nil}
-	if text != "" {
-		msg["content"] = text
-	}
-	if len(calls) > 0 {
-		msg["tool_calls"] = calls
-	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"finish_reason": "stop", "message": msg}},
-		"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 2}})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func run(t *testing.T, stdin io.Reader, args ...string) (string, string, error) {
@@ -139,7 +134,7 @@ func TestRunWithTool(t *testing.T) {
 		t.Fatalf("request = %v auth = %v", proxy.requests[0]["model"], proxy.auth[0])
 	}
 	for _, tl := range proxy.requests[0]["tools"].([]any) {
-		if name := tl.(map[string]any)["function"].(map[string]any)["name"]; name == "shell" || name == "write_file" {
+		if name := tl.(map[string]any)["name"]; name == "shell" || name == "write_file" {
 			t.Fatalf("run offered %s by default", name)
 		}
 	}
@@ -268,7 +263,7 @@ func TestConsole(t *testing.T) {
 	toolNames := func(req map[string]any) string {
 		var names []string
 		for _, tl := range req["tools"].([]any) {
-			names = append(names, tl.(map[string]any)["function"].(map[string]any)["name"].(string))
+			names = append(names, tl.(map[string]any)["name"].(string))
 		}
 		return strings.Join(names, ",")
 	}

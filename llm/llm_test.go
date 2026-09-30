@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -113,11 +114,14 @@ func TestAnthropicToolRoundTrip(t *testing.T) {
 
 func TestOpenAIToolRoundTrip(t *testing.T) {
 	rc := &recorder{responses: []string{
-		`{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
-		  "tool_calls":[{"id":"c1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}]}}],
-		  "usage":{"prompt_tokens":7,"completion_tokens":2}}`,
-		`{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"done"}}],"usage":{}}`,
-		`{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null,"refusal":"no"}}]}`,
+		`{"status":"completed","output":[
+		   {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENC"},
+		   {"type":"function_call","id":"fc_1","call_id":"c1","name":"lookup","arguments":"{\"q\":\"x\"}","status":"completed"}],
+		  "usage":{"input_tokens":7,"output_tokens":2}}`,
+		`{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{}}`,
+		`{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"no"}]}]}`,
+		`{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"par"}]}]}`,
+		`{"status":"failed","error":{"message":"server overloaded"},"output":[]}`,
 	}}
 	srv := rc.server(t)
 	p := NewOpenAI(OpenAIConfig{APIKey: "k", BaseURL: srv.URL + "/v1/"})
@@ -127,22 +131,38 @@ func TestOpenAIToolRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(turn.ToolCalls) != 1 || turn.ToolCalls[0].Name != "lookup" || string(turn.ToolCalls[0].Input) != `{"q":"x"}` || turn.Usage.InputTokens != 7 {
+	if len(turn.ToolCalls) != 1 || turn.ToolCalls[0].ID != "c1" || turn.ToolCalls[0].Name != "lookup" || string(turn.ToolCalls[0].Input) != `{"q":"x"}` || turn.Usage.InputTokens != 7 {
 		t.Fatalf("turn = %+v", turn)
 	}
-	if rc.headers[0].Get("Authorization") != "Bearer k" || rc.bodies[0]["reasoning_effort"] != nil {
-		t.Fatalf("auth/effort: %q %v", rc.headers[0].Get("Authorization"), rc.bodies[0]["reasoning_effort"])
+	req := rc.bodies[0]
+	tool := req["tools"].([]any)[0].(map[string]any)
+	if rc.headers[0].Get("Authorization") != "Bearer k" || req["instructions"] != "sys" || req["store"] != false ||
+		req["reasoning"].(map[string]any)["effort"] != "high" || req["max_output_tokens"] != float64(100) ||
+		fmt.Sprint(req["include"]) != "[reasoning.encrypted_content]" || tool["name"] != "lookup" || tool["strict"] != false {
+		t.Fatalf("first request = %v", req)
 	}
 	turn, err = conv.Send(context.Background(), "", []ToolResult{{CallID: "c1", Content: "boom", IsError: true}})
 	if err != nil || turn.Text != "done" {
 		t.Fatalf("second turn = %+v, %v", turn, err)
 	}
-	msgs := rc.bodies[1]["messages"].([]any)
-	if len(msgs) != 4 || msgs[3].(map[string]any)["role"] != "tool" || msgs[3].(map[string]any)["content"] != "ERROR: boom" {
-		t.Fatalf("history = %v", msgs)
+	// The reasoning and call go back unchanged, followed by the result.
+	items := rc.bodies[1]["input"].([]any)
+	if len(items) != 4 || items[0].(map[string]any)["content"] != "hello" || items[1].(map[string]any)["encrypted_content"] != "ENC" ||
+		items[2].(map[string]any)["call_id"] != "c1" || items[3].(map[string]any)["type"] != "function_call_output" || items[3].(map[string]any)["output"] != "ERROR: boom" {
+		t.Fatalf("history = %v", items)
 	}
 	if _, err := conv.Send(context.Background(), "again", nil); !errors.Is(err, ErrRefused) {
 		t.Fatalf("refusal err = %v", err)
+	}
+	if turn, err := conv.Send(context.Background(), "long", nil); err != nil || !turn.Truncated || turn.Text != "par" {
+		t.Fatalf("truncated turn = %+v, %v", turn, err)
+	}
+	n := len(conv.(*openAIConversation).items)
+	if _, err := conv.Send(context.Background(), "fail", nil); err == nil || !strings.Contains(err.Error(), "server overloaded") {
+		t.Fatalf("failed err = %v", err)
+	}
+	if len(conv.(*openAIConversation).items) != n {
+		t.Fatal("a failed request stayed in the history")
 	}
 	// Past the canned responses the server returns 500.
 	if _, err := conv.Send(context.Background(), "more", nil); err == nil || !strings.Contains(err.Error(), "HTTP 500") {
@@ -157,8 +177,15 @@ func TestOpenAIFindsV1(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/models":
 			_, _ = io.WriteString(w, `{"data":[{"id":"m"}]}`)
-		case "/v1/chat/completions":
-			_, _ = io.WriteString(w, `{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}]}`)
+		case "/v1/responses":
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req["model"] != "m" {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"error":{"message":"The model does not exist","code":"model_not_found"}}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -174,8 +201,15 @@ func TestOpenAIFindsV1(t *testing.T) {
 		t.Fatalf("turn = %+v, %v", turn, err)
 	}
 	// Once found, /v1 is used directly.
-	if got := strings.Join(paths, " "); got != "/models /v1/models /v1/chat/completions" {
+	if got := strings.Join(paths, " "); got != "/models /v1/models /v1/responses" {
 		t.Fatalf("paths = %s", got)
+	}
+
+	// An unknown model is a 404 too, but an API error, reported as is.
+	paths = nil
+	p = NewOpenAI(OpenAIConfig{BaseURL: srv.URL + "/v1"})
+	if _, err := p.NewConversation(Options{Model: "nope"}, "", nil).Send(context.Background(), "hello", nil); err == nil || !strings.Contains(err.Error(), "HTTP 404: The model does not exist") || len(paths) != 1 {
+		t.Fatalf("err = %v, paths = %v", err, paths)
 	}
 
 	// A real 404 is still reported.
