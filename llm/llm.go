@@ -73,3 +73,22 @@ type Provider interface {
 type Conversation interface {
 	Send(ctx context.Context, text string, results []ToolResult) (*Turn, error)
 }
+
+// Streamer is implemented by conversations that can stream the model's
+// text while it is generated. onText receives each piece of text as it
+// arrives; the returned Turn is the same as Send's.
+type Streamer interface {
+	SendStream(ctx context.Context, text string, results []ToolResult, onText func(string)) (*Turn, error)
+}
+
+// Configurable is implemented by conversations whose options and tools can
+// change between turns, e.g. to switch model mid-conversation.
+type Configurable interface {
+	SetOptions(opts Options)
+	SetTools(tools []ToolSpec)
+}
+
+// ModelLister is implemented by providers that can list their models.
+type ModelLister interface {
+	ListModels(ctx context.Context) ([]string, error)
+}

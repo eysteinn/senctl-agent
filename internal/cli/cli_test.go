@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,9 +14,10 @@ import (
 	"testing"
 )
 
-// fakeProxy is an OpenAI-compatible endpoint: when the conversation has no
-// tool result yet it asks to read notes.txt, otherwise it answers with the
-// tool result's first line.
+// fakeProxy is an OpenAI-compatible endpoint. It lists two models; when
+// the conversation has no tool result yet it asks to read notes.txt (or to
+// write hello.txt when asked to create a file), otherwise it answers with
+// the tool result's first line. It streams when asked to.
 type fakeProxy struct {
 	mu       sync.Mutex
 	requests []map[string]any
@@ -23,6 +25,10 @@ type fakeProxy struct {
 }
 
 func (f *fakeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/models") {
+		_, _ = io.WriteString(w, `{"data":[{"id":"beta"},{"id":"alpha"}]}`)
+		return
+	}
 	b, _ := io.ReadAll(r.Body)
 	var req map[string]any
 	_ = json.Unmarshal(b, &req)
@@ -32,16 +38,43 @@ func (f *fakeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 	msgs := req["messages"].([]any)
 	last := msgs[len(msgs)-1].(map[string]any)
-	var msg map[string]any
+	var text string
+	var calls []any
+	call := func(name, args string) {
+		calls = append(calls, map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": name, "arguments": args}})
+	}
 	switch {
 	case last["role"] == "tool":
-		first := strings.SplitN(last["content"].(string), "\n", 2)[0]
-		msg = map[string]any{"role": "assistant", "content": "The notes say: " + first}
+		text = "The tool says: " + strings.SplitN(last["content"].(string), "\n", 2)[0]
 	case strings.Contains(last["content"].(string), "notes"):
-		msg = map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{
-			"id": "c1", "type": "function", "function": map[string]any{"name": "read_file", "arguments": `{"path":"notes.txt"}`}}}}
+		call("read_file", `{"path":"notes.txt"}`)
+	case strings.Contains(last["content"].(string), "create"):
+		call("write_file", `{"path":"hello.txt","content":"hi\n"}`)
 	default:
-		msg = map[string]any{"role": "assistant", "content": "You said: " + last["content"].(string)}
+		text = "You said: " + last["content"].(string)
+	}
+	if req["stream"] == true {
+		w.Header().Set("Content-Type", "text/event-stream")
+		send := func(v any) { b, _ := json.Marshal(v); fmt.Fprintf(w, "data: %s\n\n", b) }
+		if text != "" {
+			half := len(text) / 2
+			send(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": text[:half]}}}})
+			send(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": text[half:]}}}})
+		}
+		for i, c := range calls {
+			c.(map[string]any)["index"] = i
+			send(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"tool_calls": []any{c}}}}})
+		}
+		send(map[string]any{"choices": []any{}, "usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 2}})
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		return
+	}
+	msg := map[string]any{"role": "assistant", "content": nil}
+	if text != "" {
+		msg["content"] = text
+	}
+	if len(calls) > 0 {
+		msg["tool_calls"] = calls
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"finish_reason": "stop", "message": msg}},
 		"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 2}})
@@ -86,7 +119,7 @@ func TestRunWithTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, stderr)
 	}
-	if strings.TrimSpace(out) != "The notes say: 1: deploy on fridays" {
+	if strings.TrimSpace(out) != "The tool says: 1: deploy on fridays" {
 		t.Fatalf("out = %q", out)
 	}
 	if !strings.Contains(stderr, "tool_call: read_file") {
@@ -126,20 +159,92 @@ func TestRunWithTool(t *testing.T) {
 	}
 }
 
-func TestChat(t *testing.T) {
+func TestConsole(t *testing.T) {
+	proxy := &fakeProxy{}
+	srv := httptest.NewServer(proxy)
+	defer srv.Close()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	dir := workspace(t)
+	saved := filepath.Join(t.TempDir(), "conv.md")
+	script := strings.Join([]string{
+		"/help",
+		"/model",
+		"/model alpha",
+		"hello \\",
+		"there",
+		"please create a file",
+		"y",
+		"read the notes",
+		"/edit off",
+		"/tools",
+		"/effort high",
+		"/usage",
+		"/save " + saved,
+		"/clear",
+		"/bogus",
+		"/exit",
+	}, "\n") + "\n"
+	out, stderr, err := run(t, strings.NewReader(script), "--provider", "openai", "--base-url", srv.URL, "--model", "m", "--dir", dir)
+	if err != nil {
+		t.Fatalf("console: %v %s", err, stderr)
+	}
+	for _, want := range []string{
+		"/model [id]",               // help
+		"Model: m", "alpha", "beta", // model listing
+		"Switched to alpha",              // model switch
+		"You said: hello \nthere",        // continued line, streamed reply
+		"Create file? hello.txt", "+ hi", // edit approval with preview
+		"The tool says: Created hello.txt (1 line).",
+		"The tool says: 1: deploy on fridays",
+		"edit is now off",
+		"Effort set to high.",
+		"input tokens 50, output tokens 10", // 5 model calls
+		"Saved to " + saved,
+		"Started a new conversation.",
+		"Unknown command /bogus",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("console output missing %q:\n%s", want, out)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "hello.txt")); err != nil || string(b) != "hi\n" {
+		t.Fatalf("hello.txt = %q, %v", b, err)
+	}
+	// Requests after /model alpha use the new model and stream.
+	if proxy.requests[0]["model"] != "alpha" || proxy.requests[0]["stream"] != true {
+		t.Fatalf("first request = %v %v", proxy.requests[0]["model"], proxy.requests[0]["stream"])
+	}
+	toolNames := func(req map[string]any) string {
+		var names []string
+		for _, tl := range req["tools"].([]any) {
+			names = append(names, tl.(map[string]any)["function"].(map[string]any)["name"].(string))
+		}
+		return strings.Join(names, ",")
+	}
+	if got := toolNames(proxy.requests[0]); !strings.Contains(got, "edit_file") || strings.Contains(got, "shell") {
+		t.Fatalf("console tools = %s (edit asks by default, shell off)", got)
+	}
+	toolsSection := out[strings.Index(out, "edit is now off"):]
+	if strings.Contains(toolsSection[:strings.Index(toolsSection, "Effort set")], "write_file") {
+		t.Fatal("/tools still lists write_file after /edit off")
+	}
+	if md, _ := os.ReadFile(saved); !strings.Contains(string(md), "## You") || !strings.Contains(string(md), "## Assistant") {
+		t.Fatalf("saved transcript = %s", md)
+	}
+}
+
+func TestConsoleDeclinedEdit(t *testing.T) {
 	srv := httptest.NewServer(&fakeProxy{})
 	defer srv.Close()
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	dir := workspace(t)
-	in := strings.NewReader("first\n/usage\nread the notes\n/reset\n/exit\n")
-	out, stderr, err := run(t, in, "chat", "--provider", "openai", "--base-url", srv.URL, "--model", "m", "--dir", dir)
-	if err != nil {
-		t.Fatalf("chat: %v %s", err, stderr)
+	out, _, err := run(t, strings.NewReader("create it\nn\n/exit\n"), "--provider", "openai", "--base-url", srv.URL, "--model", "m", "--dir", dir)
+	if err != nil || !strings.Contains(out, "declined") {
+		t.Fatalf("out = %s, err = %v", out, err)
 	}
-	for _, want := range []string{"You said: first", "input tokens 10, output tokens 2", "The notes say: 1: deploy on fridays", "Started a new conversation."} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("chat output missing %q:\n%s", want, out)
-		}
+	if _, err := os.Stat(filepath.Join(dir, "hello.txt")); err == nil {
+		t.Fatal("declined edit was written")
 	}
 }
 

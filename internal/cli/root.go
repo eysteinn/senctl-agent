@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ergochat/readline"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
@@ -22,25 +23,33 @@ import (
 // Version is set at build time with -ldflags "-X github.com/eysteinn/senctl-agent/internal/cli.Version=…".
 var Version = "dev"
 
-const defaultSystem = `You are a careful assistant working in a directory on the user's machine (%s).
-You can read its files with the tools provided%s. Look things up instead of guessing, quote the files you rely on, and answer concisely. When you are unsure, say so.`
+const defaultSystem = `You are a careful software assistant working in a directory on the user's machine (%s).
+Use the tools provided to look things up instead of guessing; the available tools can change during the conversation. Before changing a file, read it. Keep changes minimal and explain what you changed. Quote the files you rely on, answer concisely, and say when you are unsure.`
 
 // NewRootCmd builds the senctl-agent command tree.
 func NewRootCmd() *cobra.Command {
 	v := viper.New()
 	root := &cobra.Command{
-		Use:   "senctl-agent",
-		Short: "A small tool-using LLM agent for the terminal",
+		Use:   "senctl-agent [prompt]",
+		Short: "A tool-using LLM agent for the terminal",
 		Long: `senctl-agent talks to an LLM (any OpenAI-compatible endpoint such as an LLM
-proxy, or the Anthropic API) and lets it read files in a workspace directory
-through tools, optionally also run shell commands.
+proxy, or the Anthropic API). Run it without arguments for an interactive
+console (/help lists its commands), or with a prompt to start the console
+with that message. Use "senctl-agent run" for one-shot, scriptable answers.
+
+The model can read files in the workspace (--dir), edit them (--edit, asks
+first by default in the console) and optionally run shell commands (--shell).
 
 Configuration comes from flags, then environment variables (SENCTL_AGENT_PROVIDER,
 SENCTL_AGENT_BASE_URL, SENCTL_AGENT_API_KEY, SENCTL_AGENT_MODEL, …), then a config
 file ($XDG_CONFIG_HOME/senctl-agent/config.yaml or ./.senctl-agent.yaml) with the
 same keys in snake_case. The API key falls back to OPENAI_API_KEY or
 ANTHROPIC_API_KEY for the matching provider.`,
+		Args:         cobra.ArbitraryArgs,
 		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConsole(cmd, v, strings.TrimSpace(strings.Join(args, " ")))
+		},
 	}
 	bindFlags(root, v)
 	root.AddCommand(newRunCmd(v), newChatCmd(v), newConfigCmd(v), &cobra.Command{
@@ -57,7 +66,7 @@ type env struct {
 	provider llm.Provider
 	opts     llm.Options
 	system   string
-	tools    []agent.Tool
+	ws       *tools.Workspace
 }
 
 func setup(cmd *cobra.Command, v *viper.Viper) (*env, error) {
@@ -73,28 +82,9 @@ func setup(cmd *cobra.Command, v *viper.Viper) (*env, error) {
 	if err != nil {
 		return nil, fmt.Errorf("workspace: %w", err)
 	}
-	e := &env{cfg: cfg, provider: p, opts: opts, tools: ws.Tools()}
-	shellNote := ""
-	switch cfg.Shell {
-	case "auto":
-		e.tools = append(e.tools, tools.Shell(ws.Root(), 2*time.Minute, nil))
-		shellNote = " and run shell commands there"
-	case "ask":
-		tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-		if err != nil {
-			return nil, fmt.Errorf("--shell=ask needs a terminal to confirm commands: %w", err)
-		}
-		e.tools = append(e.tools, tools.Shell(ws.Root(), 2*time.Minute, func(command string) bool {
-			fmt.Fprintf(tty, "\nRun shell command in %s?\n  %s\n[y/N] ", ws.Root(), command)
-			line, _ := bufio.NewReader(tty).ReadString('\n')
-			a := strings.ToLower(strings.TrimSpace(line))
-			return a == "y" || a == "yes"
-		}))
-		shellNote = " and run shell commands there (the user confirms each one)"
-	}
-	e.system = cfg.System
+	e := &env{cfg: cfg, provider: p, opts: opts, ws: ws, system: cfg.System}
 	if e.system == "" {
-		e.system = fmt.Sprintf(defaultSystem, ws.Root(), shellNote)
+		e.system = fmt.Sprintf(defaultSystem, ws.Root())
 	}
 	return e, nil
 }
@@ -122,9 +112,57 @@ func oneLine(s string, n int) string {
 	return s
 }
 
-func isTerminal(f *os.File) bool {
-	st, err := f.Stat()
+func isTerminal(f any) bool {
+	file, ok := f.(*os.File)
+	if !ok {
+		return false
+	}
+	st, err := file.Stat()
 	return err == nil && st.Mode()&os.ModeCharDevice != 0
+}
+
+// ttyApprove asks on the controlling terminal, for one-shot runs.
+func ttyApprove() (func(question string) bool, error) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("\"ask\" needs a terminal to confirm actions: %w", err)
+	}
+	return func(question string) bool {
+		fmt.Fprintf(tty, "\n%s\n[y/N] ", question)
+		line, _ := bufio.NewReader(tty).ReadString('\n')
+		a := strings.ToLower(strings.TrimSpace(line))
+		return a == "y" || a == "yes"
+	}, nil
+}
+
+// runTools is the tool set for one-shot runs.
+func (e *env) runTools() ([]agent.Tool, error) {
+	ts := e.ws.Tools()
+	var ask func(string) bool
+	needAsk := e.cfg.Shell == modeAsk || e.cfg.Edit == modeAsk
+	if needAsk {
+		var err error
+		if ask, err = ttyApprove(); err != nil {
+			return nil, err
+		}
+	}
+	switch e.cfg.Edit {
+	case modeAuto:
+		ts = append(ts, e.ws.EditTools(nil)...)
+	case modeAsk:
+		ts = append(ts, e.ws.EditTools(func(c tools.Change) bool {
+			return ask(fmt.Sprintf("%s %s?\n%s", c.Tool, c.Path, c.Preview))
+		})...)
+	}
+	switch e.cfg.Shell {
+	case modeAuto:
+		ts = append(ts, tools.Shell(e.ws.Root(), 2*time.Minute, nil))
+	case modeAsk:
+		ts = append(ts, tools.Shell(e.ws.Root(), 2*time.Minute, func(command string) bool {
+			return ask("Run shell command in " + e.ws.Root() + "?\n  " + command)
+		}))
+	}
+	return ts, nil
 }
 
 func newRunCmd(v *viper.Viper) *cobra.Command {
@@ -135,7 +173,9 @@ func newRunCmd(v *viper.Viper) *cobra.Command {
 		Long: `Answer one prompt and exit. Piped standard input is appended to the prompt,
 so you can run e.g.:
 
-  git diff | senctl-agent run "review this change"`,
+  git diff | senctl-agent run "review this change"
+
+File editing and shell access are off unless --edit / --shell say otherwise.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			prompt := strings.TrimSpace(strings.Join(args, " "))
 			if in, ok := cmd.InOrStdin().(*os.File); ok && !isTerminal(in) {
@@ -154,19 +194,35 @@ so you can run e.g.:
 			if err != nil {
 				return err
 			}
-			conv := e.provider.NewConversation(e.opts, e.system, agent.Specs(e.tools...))
-			s := agent.NewSession(conv, e.tools, agent.Config{MaxTurns: e.cfg.MaxTurns}, recorder(cmd.ErrOrStderr(), verbose))
+			if e.cfg.Edit == "" {
+				e.cfg.Edit = modeOff
+			}
+			ts, err := e.runTools()
+			if err != nil {
+				return err
+			}
+			conv := e.provider.NewConversation(e.opts, e.system, agent.Specs(ts...))
+			s := agent.NewSession(conv, ts, agent.Config{MaxTurns: e.cfg.MaxTurns}, recorder(cmd.ErrOrStderr(), verbose))
+			out := cmd.OutOrStdout()
+			streamed := false
+			if !jsonOut && isTerminal(out) {
+				s.Stream(func(d string) { streamed = true; fmt.Fprint(out, d) })
+			}
 			answer, err := s.Send(cmd.Context(), prompt)
 			if err != nil {
 				return err
 			}
 			if jsonOut {
-				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc := json.NewEncoder(out)
 				enc.SetEscapeHTML(false)
 				return enc.Encode(map[string]any{"text": answer, "model": e.opts.Model, "provider": e.provider.Name(),
 					"usage": map[string]int64{"input_tokens": s.Usage().InputTokens, "output_tokens": s.Usage().OutputTokens}})
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), strings.TrimSpace(answer))
+			if streamed {
+				fmt.Fprintln(out)
+				return nil
+			}
+			fmt.Fprintln(out, strings.TrimSpace(answer))
 			return nil
 		},
 	}
@@ -176,56 +232,47 @@ so you can run e.g.:
 }
 
 func newChatCmd(v *viper.Viper) *cobra.Command {
-	var verbose bool
-	cmd := &cobra.Command{
-		Use:   "chat",
-		Short: "Start an interactive session (/exit to quit, /usage, /reset)",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			e, err := setup(cmd, v)
-			if err != nil {
-				return err
-			}
-			out := cmd.OutOrStdout()
-			newSession := func() *agent.Session {
-				conv := e.provider.NewConversation(e.opts, e.system, agent.Specs(e.tools...))
-				return agent.NewSession(conv, e.tools, agent.Config{MaxTurns: e.cfg.MaxTurns}, recorder(cmd.ErrOrStderr(), verbose))
-			}
-			s := newSession()
-			fmt.Fprintf(out, "senctl-agent %s · %s %s · workspace %s\nType /exit to quit.\n", Version, e.provider.Name(), e.opts.Model, e.cfg.Dir)
-			sc := bufio.NewScanner(cmd.InOrStdin())
-			sc.Buffer(make([]byte, 64<<10), 1<<20)
-			for {
-				fmt.Fprint(out, "\n> ")
-				if !sc.Scan() {
-					fmt.Fprintln(out)
-					return sc.Err()
-				}
-				line := strings.TrimSpace(sc.Text())
-				switch line {
-				case "":
-					continue
-				case "/exit", "/quit":
-					return nil
-				case "/usage":
-					u := s.Usage()
-					fmt.Fprintf(out, "input tokens %d, output tokens %d\n", u.InputTokens, u.OutputTokens)
-					continue
-				case "/reset":
-					s = newSession()
-					fmt.Fprintln(out, "Started a new conversation.")
-					continue
-				}
-				answer, err := s.Send(cmd.Context(), line)
-				if err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "error: %v\n", err)
-					continue
-				}
-				fmt.Fprintln(out, strings.TrimSpace(answer))
-			}
+	return &cobra.Command{
+		Use:   "chat [prompt]",
+		Short: "Start the interactive console (same as running senctl-agent without a command)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConsole(cmd, v, strings.TrimSpace(strings.Join(args, " ")))
 		},
 	}
-	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "print tool calls to stderr")
-	return cmd
+}
+
+func runConsole(cmd *cobra.Command, v *viper.Viper, initial string) error {
+	e, err := setup(cmd, v)
+	if err != nil {
+		return err
+	}
+	c := &console{env: e, opts: e.opts, shell: orDefault(e.cfg.Shell, modeOff), edit: orDefault(e.cfg.Edit, modeAsk)}
+	out := cmd.OutOrStdout()
+	interactive := isTerminal(cmd.InOrStdin()) && isTerminal(out)
+	c.st = style{on: isTerminal(out) && os.Getenv("NO_COLOR") == ""}
+	rlCfg := &readline.Config{
+		Prompt:          "› ",
+		Stdin:           cmd.InOrStdin(),
+		Stdout:          out,
+		Stderr:          cmd.ErrOrStderr(),
+		AutoComplete:    c.completer(),
+		InterruptPrompt: "^C",
+		EOFPrompt:       "",
+	}
+	if interactive {
+		rlCfg.HistoryFile = historyFile()
+	} else {
+		rlCfg.FuncIsTerminal = func() bool { return false }
+	}
+	rl, err := readline.NewFromConfig(rlCfg)
+	if err != nil {
+		return err
+	}
+	defer rl.Close()
+	c.rl = rl
+	c.out = out
+	c.newSession()
+	return c.run(cmd.Context(), initial)
 }
 
 func newConfigCmd(v *viper.Viper) *cobra.Command {
@@ -242,8 +289,8 @@ func newConfigCmd(v *viper.Viper) *cobra.Command {
 			if file == "" {
 				file = "(none)"
 			}
-			fmt.Fprintf(out, "config file: %s\nprovider:    %s\nbase_url:    %s\nmodel:       %s\napi_key:     %s\neffort:      %s\nmax_turns:   %d\nmax_tokens:  %d\ndir:         %s\nshell:       %s\n",
-				file, c.Provider, c.BaseURL, c.Model, mask(c.APIKey), c.Effort, c.MaxTurns, c.MaxTokens, c.Dir, c.Shell)
+			fmt.Fprintf(out, "config file: %s\nprovider:    %s\nbase_url:    %s\nmodel:       %s\napi_key:     %s\neffort:      %s\nmax_turns:   %d\nmax_tokens:  %d\ndir:         %s\nshell:       %s\nedit:        %s\n",
+				file, c.Provider, c.BaseURL, c.Model, mask(c.APIKey), c.Effort, c.MaxTurns, c.MaxTokens, c.Dir, c.Shell, orDefault(c.Edit, "(ask in the console, off for run)"))
 			return nil
 		},
 	}
