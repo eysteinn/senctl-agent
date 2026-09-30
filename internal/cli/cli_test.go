@@ -340,3 +340,24 @@ func TestConfigPrecedence(t *testing.T) {
 	expect(config(), "provider:    openai (default)", "api_key:     gene…0000")
 	expect(config("--provider", "anthropic"), "api_key:     anth…1111")
 }
+
+func TestNoWorkingDirectoryConfig(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile(localConfig, []byte("base_url: http://attacker.example/v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, err := run(t, nil, "config")
+	if err != nil || strings.Contains(out, "attacker") || !strings.Contains(stderr, "ignoring ./.senctl-agent.yaml") {
+		t.Fatalf("out = %q, stderr = %q, err = %v", out, stderr, err)
+	}
+	// Named explicitly, by flag or environment, it is used.
+	if out, _, err := run(t, nil, "config", "--config", localConfig); err != nil || !strings.Contains(out, "base_url:    http://attacker.example/v1") {
+		t.Fatalf("--config: out = %q, err = %v", out, err)
+	}
+	t.Setenv("SENCTL_AGENT_CONFIG", filepath.Join(dir, localConfig))
+	if out, _, err := run(t, nil, "config"); err != nil || !strings.Contains(out, "base_url:    http://attacker.example/v1") {
+		t.Fatalf("SENCTL_AGENT_CONFIG: out = %q, err = %v", out, err)
+	}
+}

@@ -39,13 +39,19 @@ const (
 	keyAnthropicKey = "anthropic_api_key" // ANTHROPIC_API_KEY, likewise for anthropic
 	keyNoColor      = "no_color"          // NO_COLOR
 	keyStateHome    = "xdg_state_home"    // XDG_STATE_HOME, for the console history
+	keyConfigFile   = "config_file"       // SENCTL_AGENT_CONFIG, when --config is not given
 )
+
+// localConfig is a config file some tools read from the working directory.
+// senctl-agent does not: a repository could use it to send the API key and
+// its code to an endpoint of its choosing. Name it with --config instead.
+const localConfig = ".senctl-agent.yaml"
 
 // bindFlags declares the persistent flags and wires them, the environment
 // and defaults into v.
 func bindFlags(cmd *cobra.Command, v *viper.Viper) {
 	f := cmd.PersistentFlags()
-	f.String("config", "", "config file (default $XDG_CONFIG_HOME/senctl-agent/config.yaml, then ./.senctl-agent.yaml)")
+	f.String("config", "", "config file (default $XDG_CONFIG_HOME/senctl-agent/config.yaml; also SENCTL_AGENT_CONFIG)")
 	f.String("base-url", "", "LLM proxy (or any endpoint with the OpenAI Responses API), e.g. https://llm-proxy.example.com")
 	f.String("model", "", "model id (default: the endpoint's only model, if it lists one)")
 	f.String("api-key", "", "API key (prefer SENCTL_AGENT_API_KEY or the config file: flags show up in the process list)")
@@ -68,11 +74,18 @@ func bindFlags(cmd *cobra.Command, v *viper.Viper) {
 	_ = v.BindEnv(keyAnthropicKey, "ANTHROPIC_API_KEY")
 	_ = v.BindEnv(keyNoColor, "NO_COLOR")
 	_ = v.BindEnv(keyStateHome, "XDG_STATE_HOME")
+	_ = v.BindEnv(keyConfigFile, "SENCTL_AGENT_CONFIG")
 }
 
 // load reads the config file (if any) and returns the effective config.
+// The file is the one named by --config or SENCTL_AGENT_CONFIG, else the
+// user's own; never one found in the working directory.
 func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
-	if path, _ := cmd.Flags().GetString("config"); path != "" {
+	path, _ := cmd.Flags().GetString("config")
+	if path == "" {
+		path = v.GetString(keyConfigFile)
+	}
+	if path != "" {
 		v.SetConfigFile(path)
 		if err := v.ReadInConfig(); err != nil {
 			return nil, fmt.Errorf("read config %s: %w", path, err)
@@ -87,13 +100,9 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 			if _, notFound := err.(viper.ConfigFileNotFoundError); !notFound {
 				return nil, fmt.Errorf("read config: %w", err)
 			}
-			v.SetConfigName(".senctl-agent")
-			v.AddConfigPath(".")
-			if err := v.ReadInConfig(); err != nil {
-				if _, notFound := err.(viper.ConfigFileNotFoundError); !notFound {
-					return nil, fmt.Errorf("read config: %w", err)
-				}
-			}
+		}
+		if _, err := os.Stat(localConfig); err == nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "senctl-agent: ignoring ./%s; pass --config %s to use it\n", localConfig, localConfig)
 		}
 	}
 	var c Config
