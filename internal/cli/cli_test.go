@@ -19,6 +19,7 @@ import (
 // write hello.txt when asked to create a file), otherwise it answers with
 // the tool result's first line. It streams when asked to.
 type fakeProxy struct {
+	models   []string // default beta, alpha
 	mu       sync.Mutex
 	requests []map[string]any
 	auth     []string
@@ -26,7 +27,17 @@ type fakeProxy struct {
 
 func (f *fakeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/models") {
-		_, _ = io.WriteString(w, `{"data":[{"id":"beta"},{"id":"alpha"}]}`)
+		f.mu.Lock()
+		models := f.models
+		f.mu.Unlock()
+		if models == nil {
+			models = []string{"beta", "alpha"}
+		}
+		var data []map[string]string
+		for _, m := range models {
+			data = append(data, map[string]string{"id": m})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
 		return
 	}
 	b, _ := io.ReadAll(r.Body)
@@ -109,7 +120,6 @@ func TestRunWithTool(t *testing.T) {
 	proxy := &fakeProxy{}
 	srv := httptest.NewServer(proxy)
 	defer srv.Close()
-	t.Setenv("SENCTL_AGENT_PROVIDER", "openai")
 	t.Setenv("SENCTL_AGENT_BASE_URL", srv.URL)
 	t.Setenv("OPENAI_API_KEY", "sk-test")
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -172,8 +182,22 @@ func TestRunWithTool(t *testing.T) {
 		t.Fatalf("session cache left behind: %v", left)
 	}
 
-	if _, _, err := run(t, nil, "run", "x", "--dir", dir); err == nil || !strings.Contains(err.Error(), "no model") {
+	if _, _, err := run(t, nil, "run", "x", "--dir", dir); err == nil || !strings.Contains(err.Error(), "the endpoint offers: alpha, beta") {
 		t.Fatalf("missing model err = %v", err)
+	}
+	if out, _, err := run(t, nil, "models"); err != nil || out != "alpha\nbeta\n" {
+		t.Fatalf("models = %q, %v", out, err)
+	}
+
+	// With only a proxy URL and key, its one model is used.
+	proxy.mu.Lock()
+	proxy.models = []string{"only-model"}
+	proxy.mu.Unlock()
+	if out, _, err := run(t, nil, "run", "hello", "--dir", dir); err != nil || strings.TrimSpace(out) != "You said: hello" {
+		t.Fatalf("out = %q, %v", out, err)
+	}
+	if last := proxy.requests[len(proxy.requests)-1]["model"]; last != "only-model" {
+		t.Fatalf("model = %v", last)
 	}
 	if _, _, err := run(t, nil, "run", "x", "--model", "m", "--shell", "sometimes"); err == nil {
 		t.Fatal("invalid --shell accepted")
@@ -210,7 +234,7 @@ func TestConsole(t *testing.T) {
 		"/bogus",
 		"/exit",
 	}, "\n") + "\n"
-	out, stderr, err := run(t, strings.NewReader(script), "--provider", "openai", "--base-url", srv.URL, "--model", "m", "--dir", dir)
+	out, stderr, err := run(t, strings.NewReader(script), "--base-url", srv.URL, "--model", "m", "--dir", dir)
 	if err != nil {
 		t.Fatalf("console: %v %s", err, stderr)
 	}
@@ -265,7 +289,7 @@ func TestConsoleDeclinedEdit(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	dir := workspace(t)
-	out, _, err := run(t, strings.NewReader("create it\nn\n/exit\n"), "--provider", "openai", "--base-url", srv.URL, "--model", "m", "--dir", dir)
+	out, _, err := run(t, strings.NewReader("create it\nn\n/exit\n"), "--base-url", srv.URL, "--model", "m", "--dir", dir)
 	if err != nil || !strings.Contains(out, "declined") {
 		t.Fatalf("out = %s, err = %v", out, err)
 	}

@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -35,9 +37,9 @@ type Config struct {
 func bindFlags(cmd *cobra.Command, v *viper.Viper) {
 	f := cmd.PersistentFlags()
 	f.String("config", "", "config file (default $XDG_CONFIG_HOME/senctl-agent/config.yaml, then ./.senctl-agent.yaml)")
-	f.String("provider", "", "model provider: openai (any OpenAI-compatible endpoint or LLM proxy) or anthropic")
-	f.String("base-url", "", "endpoint, e.g. https://llm-proxy.example.com/v1")
-	f.String("model", "", "model id (default claude-opus-5-5 for anthropic)")
+	f.String("base-url", "", "LLM proxy (or any OpenAI-compatible endpoint), e.g. https://llm-proxy.example.com")
+	f.String("model", "", "model id (default: the endpoint's only model, if it lists one)")
+	f.String("provider", "", "API to speak: openai (default; the chat completions API proxies use) or anthropic (the Anthropic API directly)")
 	f.String("effort", "", "reasoning effort: low, medium, high")
 	f.Int("max-turns", 30, "maximum model calls per prompt")
 	f.Int64("max-tokens", 16000, "maximum output tokens per model call")
@@ -88,10 +90,9 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 	}
 	c.Provider = strings.ToLower(strings.TrimSpace(c.Provider))
 	if c.APIKey == "" {
-		switch c.Provider {
-		case llm.ProviderAnthropic:
+		if c.Provider == llm.ProviderAnthropic {
 			c.APIKey = os.Getenv("ANTHROPIC_API_KEY")
-		case llm.ProviderOpenAI:
+		} else {
 			c.APIKey = os.Getenv("OPENAI_API_KEY")
 		}
 	}
@@ -108,14 +109,9 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 	return &c, nil
 }
 
-// provider builds the configured model provider.
-func (c *Config) provider() (llm.Provider, llm.Options, error) {
-	if c.Provider == "" {
-		return nil, llm.Options{}, fmt.Errorf("no provider configured: set --provider or SENCTL_AGENT_PROVIDER (openai or anthropic); see senctl-agent config --help")
-	}
-	if c.Model == "" {
-		return nil, llm.Options{}, fmt.Errorf("no model configured: set --model or SENCTL_AGENT_MODEL")
-	}
+// provider builds the configured model provider. Without a model it uses
+// the endpoint's only model, or says which ones there are.
+func (c *Config) provider(ctx context.Context) (llm.Provider, llm.Options, error) {
 	cfg := llm.Config{Provider: c.Provider, APIKey: c.APIKey, BaseURL: c.BaseURL, SendEffort: c.SendEffort}
 	switch strings.ToLower(c.Fallbacks) {
 	case "true", "1", "yes", "on":
@@ -129,7 +125,42 @@ func (c *Config) provider() (llm.Provider, llm.Options, error) {
 	if err != nil {
 		return nil, llm.Options{}, err
 	}
+	if c.Model == "" {
+		if c.Model, err = onlyModel(ctx, p); err != nil {
+			return nil, llm.Options{}, err
+		}
+	}
 	return p, llm.Options{Model: c.Model, Effort: c.Effort, MaxTokens: c.MaxTokens}, nil
+}
+
+// onlyModel asks the endpoint which models it serves and returns the one
+// there is; with several, the choice is the user's.
+func onlyModel(ctx context.Context, p llm.Provider) (string, error) {
+	const hint = "set --model, SENCTL_AGENT_MODEL or model: in the config file"
+	ml, ok := p.(llm.ModelLister)
+	if !ok {
+		return "", fmt.Errorf("no model configured: %s", hint)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	ids, err := ml.ListModels(ctx)
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("no model configured, and listing the endpoint's models failed: %w (%s)", err, hint)
+	case len(ids) == 1:
+		return ids[0], nil
+	case len(ids) == 0:
+		return "", fmt.Errorf("no model configured and the endpoint lists none: %s", hint)
+	}
+	shown := ids
+	if len(shown) > 30 {
+		shown = shown[:30]
+	}
+	more := ""
+	if len(ids) > len(shown) {
+		more = fmt.Sprintf(" (and %d more; senctl-agent models lists them all)", len(ids)-len(shown))
+	}
+	return "", fmt.Errorf("no model configured; the endpoint offers: %s%s. Pick one: %s", strings.Join(shown, ", "), more, hint)
 }
 
 func mask(key string) string {

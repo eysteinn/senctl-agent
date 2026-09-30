@@ -33,19 +33,21 @@ func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "senctl-agent [prompt]",
 		Short: "A tool-using LLM agent for the terminal",
-		Long: `senctl-agent talks to an LLM (any OpenAI-compatible endpoint such as an LLM
-proxy, or the Anthropic API). Run it without arguments for an interactive
-console (/help lists its commands), or with a prompt to start the console
-with that message. Use "senctl-agent run" for one-shot, scriptable answers.
+		Long: `senctl-agent talks to an LLM through an LLM proxy (or any endpoint that speaks
+the standard OpenAI chat completions API). Point it at the proxy with an API key;
+the model defaults to the proxy's only model, if it lists one. Run it without
+arguments for an interactive console (/help lists its commands), or with a
+prompt to start the console with that message. Use "senctl-agent run" for
+one-shot, scriptable answers.
 
 The model can read files in the workspace (--dir), edit them (--edit, asks
 first by default in the console) and optionally run shell commands (--shell).
 
-Configuration comes from flags, then environment variables (SENCTL_AGENT_PROVIDER,
-SENCTL_AGENT_BASE_URL, SENCTL_AGENT_API_KEY, SENCTL_AGENT_MODEL, …), then a config
-file ($XDG_CONFIG_HOME/senctl-agent/config.yaml or ./.senctl-agent.yaml) with the
-same keys in snake_case. The API key falls back to OPENAI_API_KEY or
-ANTHROPIC_API_KEY for the matching provider.`,
+Configuration comes from flags, then environment variables (SENCTL_AGENT_BASE_URL,
+SENCTL_AGENT_API_KEY, SENCTL_AGENT_MODEL, …), then a config file
+($XDG_CONFIG_HOME/senctl-agent/config.yaml or ./.senctl-agent.yaml) with the same
+keys in snake_case. The API key falls back to OPENAI_API_KEY. To call the
+Anthropic API directly instead of a proxy, set provider to anthropic.`,
 		Args:         cobra.ArbitraryArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -53,7 +55,7 @@ ANTHROPIC_API_KEY for the matching provider.`,
 		},
 	}
 	bindFlags(root, v)
-	root.AddCommand(newRunCmd(v), newChatCmd(v), newConfigCmd(v), &cobra.Command{
+	root.AddCommand(newRunCmd(v), newChatCmd(v), newConfigCmd(v), newModelsCmd(v), &cobra.Command{
 		Use:   "version",
 		Short: "Print the version",
 		Run:   func(cmd *cobra.Command, _ []string) { fmt.Fprintln(cmd.OutOrStdout(), Version) },
@@ -98,7 +100,7 @@ func setup(cmd *cobra.Command, v *viper.Viper) (*env, error) {
 	if err != nil {
 		return nil, err
 	}
-	p, opts, err := cfg.provider()
+	p, opts, err := cfg.provider(cmd.Context())
 	if err != nil {
 		return nil, err
 	}
@@ -317,6 +319,36 @@ func runConsole(cmd *cobra.Command, v *viper.Viper, initial string) error {
 	return c.run(cmd.Context(), initial)
 }
 
+func newModelsCmd(v *viper.Viper) *cobra.Command {
+	return &cobra.Command{
+		Use:   "models",
+		Short: "List the models the endpoint serves",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			c, err := load(cmd, v)
+			if err != nil {
+				return err
+			}
+			c.Model = "-" // listing needs no model
+			p, _, err := c.provider(cmd.Context())
+			if err != nil {
+				return err
+			}
+			ml, ok := p.(llm.ModelLister)
+			if !ok {
+				return fmt.Errorf("%s cannot list models", p.Name())
+			}
+			ids, err := ml.ListModels(cmd.Context())
+			if err != nil {
+				return err
+			}
+			for _, id := range ids {
+				fmt.Fprintln(cmd.OutOrStdout(), id)
+			}
+			return nil
+		},
+	}
+}
+
 func newConfigCmd(v *viper.Viper) *cobra.Command {
 	return &cobra.Command{
 		Use:   "config",
@@ -332,7 +364,7 @@ func newConfigCmd(v *viper.Viper) *cobra.Command {
 				file = "(none)"
 			}
 			fmt.Fprintf(out, "config file: %s\nprovider:    %s\nbase_url:    %s\nmodel:       %s\napi_key:     %s\neffort:      %s\nmax_turns:   %d\nmax_tokens:  %d\ndir:         %s\nshell:       %s\nedit:        %s\n",
-				file, c.Provider, c.BaseURL, c.Model, mask(c.APIKey), c.Effort, c.MaxTurns, c.MaxTokens, c.Dir, c.Shell, orDefault(c.Edit, "(ask in the console, off for run)"))
+				file, orDefault(c.Provider, "openai (default)"), c.BaseURL, c.Model, mask(c.APIKey), c.Effort, c.MaxTurns, c.MaxTokens, c.Dir, c.Shell, orDefault(c.Edit, "(ask in the console, off for run)"))
 			return nil
 		},
 	}

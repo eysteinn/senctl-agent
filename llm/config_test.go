@@ -12,7 +12,7 @@ func TestNew(t *testing.T) {
 		{Config{Provider: "openai", BaseURL: "http://proxy/v1"}, "openai", false},
 		{Config{Provider: "Anthropic"}, "anthropic", false},
 		{Config{Provider: "anthropic", Fallbacks: &off}, "anthropic", false},
-		{Config{}, "", true},
+		{Config{BaseURL: "http://proxy"}, "openai", false},
 		{Config{Provider: "other"}, "", true},
 	}
 	for _, tt := range tests {
