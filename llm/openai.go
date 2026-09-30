@@ -209,8 +209,9 @@ func (c *openAIConversation) post(ctx context.Context, stream bool) (*http.Respo
 		body["tools"] = c.tools
 		body["tool_choice"] = "auto"
 	}
-	if c.opts.MaxTokens > 0 {
-		body["max_output_tokens"] = c.opts.MaxTokens
+	body["max_output_tokens"] = c.opts.MaxTokens
+	if c.opts.MaxTokens <= 0 {
+		body["max_output_tokens"] = DefaultMaxTokens
 	}
 	if c.opts.Effort != "" {
 		body["reasoning"] = map[string]string{"effort": c.opts.Effort}

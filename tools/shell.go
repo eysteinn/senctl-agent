@@ -15,13 +15,17 @@ import (
 // Anything too long for the model is left to agent.Config.Spill.
 const maxShellOutput = 16 << 20
 
+// DefaultShellTimeout is how long a shell command may run when Shell is
+// given no timeout.
+const DefaultShellTimeout = 2 * time.Minute
+
 // Shell returns a tool that runs shell commands in dir with a timeout. It
 // can change files and reach the network, so only offer it when the user
 // asked for it. Approve, when set, is asked before each command; returning
 // false refuses it.
 func Shell(dir string, timeout time.Duration, approve func(command string) bool) agent.Tool {
 	if timeout <= 0 {
-		timeout = 2 * time.Minute
+		timeout = DefaultShellTimeout
 	}
 	return agent.Tool{
 		Spec: llm.ToolSpec{

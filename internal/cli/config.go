@@ -6,16 +6,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
+	"github.com/eysteinn/senctl-agent/agent"
 	"github.com/eysteinn/senctl-agent/llm"
 )
 
-// Config is the effective CLI configuration: flags override environment
-// (SENCTL_AGENT_*), which overrides the config file.
+// Config is the effective CLI configuration. Every setting is resolved by
+// viper in the same order: a flag, then its environment variable
+// (SENCTL_AGENT_*), then the config file, then the default, which is the
+// library's own default where there is one.
 type Config struct {
 	Provider  string `mapstructure:"provider"`
 	BaseURL   string `mapstructure:"base_url"`
@@ -31,6 +33,14 @@ type Config struct {
 	Edit      string `mapstructure:"edit"`
 }
 
+// Environment variables the CLI reads besides SENCTL_AGENT_*, as viper keys.
+const (
+	keyOpenAIKey    = "openai_api_key"    // OPENAI_API_KEY, when api_key is unset
+	keyAnthropicKey = "anthropic_api_key" // ANTHROPIC_API_KEY, likewise for anthropic
+	keyNoColor      = "no_color"          // NO_COLOR
+	keyStateHome    = "xdg_state_home"    // XDG_STATE_HOME, for the console history
+)
+
 // bindFlags declares the persistent flags and wires them, the environment
 // and defaults into v.
 func bindFlags(cmd *cobra.Command, v *viper.Viper) {
@@ -38,23 +48,26 @@ func bindFlags(cmd *cobra.Command, v *viper.Viper) {
 	f.String("config", "", "config file (default $XDG_CONFIG_HOME/senctl-agent/config.yaml, then ./.senctl-agent.yaml)")
 	f.String("base-url", "", "LLM proxy (or any endpoint with the OpenAI Responses API), e.g. https://llm-proxy.example.com")
 	f.String("model", "", "model id (default: the endpoint's only model, if it lists one)")
+	f.String("api-key", "", "API key (prefer SENCTL_AGENT_API_KEY or the config file: flags show up in the process list)")
 	f.String("provider", "", "API to speak: openai (default; the OpenAI Responses API, which proxies serve) or anthropic (the Anthropic API directly)")
+	f.String("fallbacks", "", "anthropic: server-side refusal fallback, true or false (default: on for the first-party API)")
 	f.String("effort", "", "reasoning effort: low, medium, high")
-	f.Int("max-turns", 30, "maximum model calls per prompt")
-	f.Int64("max-tokens", 16000, "maximum output tokens per model call")
+	f.Int("max-turns", agent.DefaultMaxTurns, "maximum model calls per prompt")
+	f.Int64("max-tokens", llm.DefaultMaxTokens, "maximum output tokens per model call")
 	f.String("system", "", "system prompt (replaces the default)")
 	f.String("dir", ".", "workspace directory the file tools can read")
 	f.String("shell", "off", "shell tool: off, ask (confirm each command) or auto")
 	f.String("edit", "", "file editing: off, ask (confirm each change) or auto (default: ask in the console, off for run)")
-	for _, name := range []string{"provider", "base-url", "model", "effort", "max-turns", "max-tokens", "system", "dir", "shell", "edit"} {
+	for _, name := range []string{"api-key", "provider", "fallbacks", "base-url", "model", "effort", "max-turns", "max-tokens", "system", "dir", "shell", "edit"} {
 		_ = v.BindPFlag(strings.ReplaceAll(name, "-", "_"), f.Lookup(name))
 	}
 	v.SetEnvPrefix("SENCTL_AGENT")
 	v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	v.AutomaticEnv()
-	for _, k := range []string{"api_key", "fallbacks"} {
-		_ = v.BindEnv(k)
-	}
+	_ = v.BindEnv(keyOpenAIKey, "OPENAI_API_KEY")
+	_ = v.BindEnv(keyAnthropicKey, "ANTHROPIC_API_KEY")
+	_ = v.BindEnv(keyNoColor, "NO_COLOR")
+	_ = v.BindEnv(keyStateHome, "XDG_STATE_HOME")
 }
 
 // load reads the config file (if any) and returns the effective config.
@@ -90,13 +103,10 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 	c.Provider = strings.ToLower(strings.TrimSpace(c.Provider))
 	if c.APIKey == "" {
 		if c.Provider == llm.ProviderAnthropic {
-			c.APIKey = os.Getenv("ANTHROPIC_API_KEY")
+			c.APIKey = v.GetString(keyAnthropicKey)
 		} else {
-			c.APIKey = os.Getenv("OPENAI_API_KEY")
+			c.APIKey = v.GetString(keyOpenAIKey)
 		}
-	}
-	if c.Model == "" {
-		c.Model = llm.DefaultModel(c.Provider)
 	}
 	for name, v := range map[string]string{"shell": c.Shell, "edit": c.Edit} {
 		switch v {
@@ -108,8 +118,8 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 	return &c, nil
 }
 
-// provider builds the configured model provider. Without a model it uses
-// the endpoint's only model, or says which ones there are.
+// provider builds the configured model provider. Without a model it takes
+// the library's default (llm.ResolveModel).
 func (c *Config) provider(ctx context.Context) (llm.Provider, llm.Options, error) {
 	cfg := llm.Config{Provider: c.Provider, APIKey: c.APIKey, BaseURL: c.BaseURL}
 	switch strings.ToLower(c.Fallbacks) {
@@ -124,42 +134,12 @@ func (c *Config) provider(ctx context.Context) (llm.Provider, llm.Options, error
 	if err != nil {
 		return nil, llm.Options{}, err
 	}
-	if c.Model == "" {
-		if c.Model, err = onlyModel(ctx, p); err != nil {
-			return nil, llm.Options{}, err
-		}
+	model, err := llm.ResolveModel(ctx, p, c.Model)
+	if err != nil {
+		return nil, llm.Options{}, fmt.Errorf("%w; set --model, SENCTL_AGENT_MODEL or model: in the config file (senctl-agent models lists them)", err)
 	}
+	c.Model = model
 	return p, llm.Options{Model: c.Model, Effort: c.Effort, MaxTokens: c.MaxTokens}, nil
-}
-
-// onlyModel asks the endpoint which models it serves and returns the one
-// there is; with several, the choice is the user's.
-func onlyModel(ctx context.Context, p llm.Provider) (string, error) {
-	const hint = "set --model, SENCTL_AGENT_MODEL or model: in the config file"
-	ml, ok := p.(llm.ModelLister)
-	if !ok {
-		return "", fmt.Errorf("no model configured: %s", hint)
-	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	ids, err := ml.ListModels(ctx)
-	switch {
-	case err != nil:
-		return "", fmt.Errorf("no model configured, and listing the endpoint's models failed: %w (%s)", err, hint)
-	case len(ids) == 1:
-		return ids[0], nil
-	case len(ids) == 0:
-		return "", fmt.Errorf("no model configured and the endpoint lists none: %s", hint)
-	}
-	shown := ids
-	if len(shown) > 30 {
-		shown = shown[:30]
-	}
-	more := ""
-	if len(ids) > len(shown) {
-		more = fmt.Sprintf(" (and %d more; senctl-agent models lists them all)", len(ids)-len(shown))
-	}
-	return "", fmt.Errorf("no model configured; the endpoint offers: %s%s. Pick one: %s", strings.Join(shown, ", "), more, hint)
 }
 
 func mask(key string) string {

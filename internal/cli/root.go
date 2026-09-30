@@ -190,9 +190,9 @@ func (e *env) runTools() ([]agent.Tool, error) {
 	}
 	switch e.cfg.Shell {
 	case modeAuto:
-		ts = append(ts, tools.Shell(e.ws.Root(), 2*time.Minute, nil))
+		ts = append(ts, tools.Shell(e.ws.Root(), tools.DefaultShellTimeout, nil))
 	case modeAsk:
-		ts = append(ts, tools.Shell(e.ws.Root(), 2*time.Minute, func(command string) bool {
+		ts = append(ts, tools.Shell(e.ws.Root(), tools.DefaultShellTimeout, func(command string) bool {
 			return ask("Run shell command in " + e.ws.Root() + "?\n  " + command)
 		}))
 	}
@@ -293,7 +293,7 @@ func runConsole(cmd *cobra.Command, v *viper.Viper, initial string) error {
 	c := &console{env: e, opts: e.opts, shell: orDefault(e.cfg.Shell, modeOff), edit: orDefault(e.cfg.Edit, modeAsk)}
 	out := cmd.OutOrStdout()
 	interactive := isTerminal(cmd.InOrStdin()) && isTerminal(out)
-	c.st = style{on: isTerminal(out) && os.Getenv("NO_COLOR") == ""}
+	c.st = style{on: isTerminal(out) && v.GetString(keyNoColor) == ""}
 	rlCfg := &readline.Config{
 		Prompt:          "› ",
 		Stdin:           cmd.InOrStdin(),
@@ -304,7 +304,7 @@ func runConsole(cmd *cobra.Command, v *viper.Viper, initial string) error {
 		EOFPrompt:       "",
 	}
 	if interactive {
-		rlCfg.HistoryFile = historyFile()
+		rlCfg.HistoryFile = historyFile(v.GetString(keyStateHome))
 	} else {
 		rlCfg.FuncIsTerminal = func() bool { return false }
 	}
