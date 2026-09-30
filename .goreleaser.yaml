@@ -1,0 +1,50 @@
+# Release builds of the senctl-agent CLI. A tag push (v*) runs this through
+# .github/workflows/release.yml; `goreleaser release --snapshot --clean`
+# builds the same artifacts locally without publishing.
+version: 2
+
+project_name: senctl-agent
+
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - id: senctl-agent
+    main: ./cmd/senctl-agent
+    binary: senctl-agent
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/eysteinn/senctl-agent/internal/cli.Version={{ .Version }}
+
+archives:
+  - id: senctl-agent
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^Merge "
+
+release:
+  draft: false
+  prerelease: auto
