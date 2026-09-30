@@ -1,6 +1,10 @@
 package llm
 
-import "testing"
+import (
+	"context"
+	"strings"
+	"testing"
+)
 
 func TestNew(t *testing.T) {
 	off := false
@@ -23,5 +27,33 @@ func TestNew(t *testing.T) {
 	}
 	if DefaultModel("anthropic") != DefaultAnthropicModel || DefaultModel("openai") != "" {
 		t.Fatal("DefaultModel")
+	}
+}
+
+type listing struct {
+	Provider
+	ids []string
+}
+
+func (l listing) ListModels(context.Context) ([]string, error) { return l.ids, nil }
+
+func TestResolveModel(t *testing.T) {
+	ctx := context.Background()
+	openai := NewOpenAI(OpenAIConfig{})
+	for _, tt := range []struct {
+		p           Provider
+		model, want string
+		err         string
+	}{
+		{openai, "given", "given", ""},
+		{NewAnthropic(AnthropicConfig{}), "", DefaultAnthropicModel, ""},
+		{listing{openai, []string{"only"}}, "", "only", ""},
+		{listing{openai, []string{"a", "b"}}, "", "", "the endpoint offers a, b"},
+		{listing{openai, nil}, "", "", "lists none"},
+	} {
+		got, err := ResolveModel(ctx, tt.p, tt.model)
+		if got != tt.want || (tt.err == "") != (err == nil) || err != nil && !strings.Contains(err.Error(), tt.err) {
+			t.Errorf("ResolveModel(%q) = %q, %v", tt.model, got, err)
+		}
 	}
 }

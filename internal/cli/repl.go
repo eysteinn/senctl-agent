@@ -191,7 +191,7 @@ func (c *console) tools() []agent.Tool {
 		ts = append(ts, c.env.ws.EditTools(c.approveEdit)...)
 	}
 	if c.shell != modeOff {
-		ts = append(ts, tools.Shell(c.env.ws.Root(), 2*time.Minute, c.approveShell))
+		ts = append(ts, tools.Shell(c.env.ws.Root(), tools.DefaultShellTimeout, c.approveShell))
 	}
 	return ts
 }
@@ -460,8 +460,10 @@ func (c *console) run(ctx context.Context, initial string) error {
 	}
 }
 
-func historyFile() string {
-	dir := os.Getenv("XDG_STATE_HOME")
+// historyFile is the console history under stateHome ($XDG_STATE_HOME,
+// default ~/.local/state).
+func historyFile(stateHome string) string {
+	dir := stateHome
 	if dir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {

@@ -177,7 +177,7 @@ func TestRunWithTool(t *testing.T) {
 		t.Fatalf("session cache left behind: %v", left)
 	}
 
-	if _, _, err := run(t, nil, "run", "x", "--dir", dir); err == nil || !strings.Contains(err.Error(), "the endpoint offers: alpha, beta") {
+	if _, _, err := run(t, nil, "run", "x", "--dir", dir); err == nil || !strings.Contains(err.Error(), "the endpoint offers alpha, beta") {
 		t.Fatalf("missing model err = %v", err)
 	}
 	if out, _, err := run(t, nil, "models"); err != nil || out != "alpha\nbeta\n" {
@@ -299,18 +299,44 @@ func TestConfigPrecedence(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(cfgDir, "senctl-agent"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	yaml := "provider: anthropic\nmodel: from-file\nbase_url: http://file/v1\napi_key: file-key-123456\nmax_turns: 7\n"
+	yaml := "provider: anthropic\nmodel: from-file\nbase_url: http://file/v1\napi_key: file-key-123456\nmax_turns: 7\neffort: low\nshell: ask\n"
 	if err := os.WriteFile(filepath.Join(cfgDir, "senctl-agent", "config.yaml"), []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("SENCTL_AGENT_MODEL", "from-env")
-	out, _, err := run(t, nil, "config", "--base-url", "http://flag/v1")
-	if err != nil {
-		t.Fatal(err)
+	config := func(args ...string) string {
+		t.Helper()
+		out, _, err := run(t, nil, append([]string{"config"}, args...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
 	}
-	for _, want := range []string{"provider:    anthropic", "model:       from-env", "base_url:    http://flag/v1", "api_key:     file…3456", "max_turns:   7", "config.yaml"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("config output missing %q:\n%s", want, out)
+	expect := func(out string, want ...string) {
+		t.Helper()
+		for _, w := range want {
+			if !strings.Contains(out, w) {
+				t.Fatalf("config output missing %q:\n%s", w, out)
+			}
 		}
 	}
+	// Each setting: flag, then environment, then file, then default.
+	t.Setenv("SENCTL_AGENT_MODEL", "from-env")
+	t.Setenv("SENCTL_AGENT_EFFORT", "high")
+	t.Setenv("SENCTL_AGENT_BASE_URL", "http://env/v1")
+	t.Setenv("OPENAI_API_KEY", "generic-key-000000")
+	expect(config("--base-url", "http://flag/v1", "--effort", "medium"),
+		"provider:    anthropic", "model:       from-env", "base_url:    http://flag/v1", "effort:      medium",
+		"api_key:     file…3456", "max_turns:   7", "max_tokens:  16000", "shell:       ask", "config.yaml")
+	expect(config("--api-key", "flag-key-abcdef", "--shell", "off"), "api_key:     flag…cdef", "effort:      high", "shell:       off", "base_url:    http://env/v1")
+	t.Setenv("SENCTL_AGENT_API_KEY", "env-key-987654")
+	expect(config(), "api_key:     env-…7654")
+
+	// OPENAI_API_KEY / ANTHROPIC_API_KEY stand in only when no api_key is set
+	// anywhere, matching the provider.
+	empty := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", empty)
+	t.Setenv("SENCTL_AGENT_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "anthropic-key-111111")
+	expect(config(), "provider:    openai (default)", "api_key:     gene…0000")
+	expect(config("--provider", "anthropic"), "api_key:     anth…1111")
 }

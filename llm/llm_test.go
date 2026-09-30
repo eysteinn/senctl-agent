@@ -218,3 +218,30 @@ func TestOpenAIFindsV1(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestNoEnvironment(t *testing.T) {
+	// The library uses only what it is given, whatever the environment says.
+	t.Setenv("ANTHROPIC_API_KEY", "env-key")
+	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+	rc := &recorder{responses: []string{
+		`{"id":"m","type":"message","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{}}`,
+		`{"status":"completed","output":[]}`,
+	}}
+	srv := rc.server(t)
+	if _, err := NewAnthropic(AnthropicConfig{BaseURL: srv.URL}).NewConversation(Options{}, "", nil).Send(context.Background(), "hi", nil); err != nil {
+		t.Fatal(err)
+	}
+	if k := rc.headers[0].Get("X-Api-Key"); k != "" {
+		t.Fatalf("anthropic sent key %q from the environment", k)
+	}
+	if rc.bodies[0]["max_tokens"] != float64(DefaultMaxTokens) || rc.bodies[0]["model"] != DefaultAnthropicModel {
+		t.Fatalf("anthropic defaults: %v", rc.bodies[0])
+	}
+	t.Setenv("OPENAI_API_KEY", "env-key")
+	if _, err := NewOpenAI(OpenAIConfig{BaseURL: srv.URL + "/v1"}).NewConversation(Options{Model: "m"}, "", nil).Send(context.Background(), "hi", nil); err != nil {
+		t.Fatal(err)
+	}
+	if k := rc.headers[1].Get("Authorization"); k != "" || rc.bodies[1]["max_output_tokens"] != float64(DefaultMaxTokens) {
+		t.Fatalf("openai auth %q, body %v", k, rc.bodies[1])
+	}
+}

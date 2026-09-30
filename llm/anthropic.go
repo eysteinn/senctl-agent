@@ -30,7 +30,9 @@ type anthropicProvider struct {
 
 // NewAnthropic returns a provider backed by the official Anthropic SDK.
 func NewAnthropic(cfg AnthropicConfig) Provider {
-	var opts []option.RequestOption
+	// Only cfg counts: the SDK would otherwise pick up ANTHROPIC_API_KEY,
+	// ANTHROPIC_BASE_URL and other variables from the environment.
+	opts := []option.RequestOption{option.WithoutEnvironmentDefaults()}
 	if cfg.APIKey != "" {
 		opts = append(opts, option.WithAPIKey(cfg.APIKey))
 	}
@@ -77,7 +79,7 @@ func (c *anthropicConversation) SetOptions(opts Options) {
 		opts.Model = DefaultAnthropicModel
 	}
 	if opts.MaxTokens <= 0 {
-		opts.MaxTokens = 16000
+		opts.MaxTokens = DefaultMaxTokens
 	}
 	c.opts = opts
 }

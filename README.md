@@ -97,8 +97,10 @@ In `run`, `ask` confirms on the terminal (`/dev/tty`), so it also works with pip
 
 ### Configuration
 
-Settings come from flags, then `SENCTL_AGENT_*` environment variables, then a YAML file
-(`$XDG_CONFIG_HOME/senctl-agent/config.yaml` or `./.senctl-agent.yaml`):
+Every setting is resolved the same way: a **flag** (`--base-url`), then its **environment
+variable** (`SENCTL_AGENT_BASE_URL`), then the **config file**
+(`$XDG_CONFIG_HOME/senctl-agent/config.yaml` or `./.senctl-agent.yaml`, keys in snake_case),
+then the default. `senctl-agent config` shows the result.
 
 ```yaml
 base_url: https://llm-proxy.example.com
@@ -115,7 +117,9 @@ fallbacks: ""         # anthropic: server-side refusal fallback (default on for 
 
 Only `base_url` and `api_key` are needed for a proxy. If the URL answers 404, `/v1` is
 tried and kept, so either form of the address works. Without a model, the proxy's only
-model is used; if it serves several, the error lists them.
+model is used; if it serves several, the error lists them. `OPENAI_API_KEY` (or
+`ANTHROPIC_API_KEY` with `provider: anthropic`) is used only when `api_key` is set nowhere
+else. `NO_COLOR` turns off colour in the console.
 
 ## Library
 
@@ -154,6 +158,13 @@ Packages:
 | `agent` | `Session` and `Run`, tool definitions, event recording, turn and output limits, spilling oversized tool output (`Config.Spill`) |
 | `evidence` | Verbatim-quote checking against the text an agent was shown |
 | `tools` | Workspace file tools for files of any size (read-only, plus write/edit with an approval hook), the read-only `pipeline` tool, a `Cache` for oversized output, and an opt-in shell tool |
+
+The library reads nothing from the environment or from files: every setting is passed
+in by the caller (`llm.Config`, `llm.Options`, `agent.Config`, …). Settings left at their
+zero value get the same defaults the CLI uses: `llm.DefaultMaxTokens`,
+`agent.DefaultMaxTurns`, `agent.DefaultMaxToolOutput`, `tools.DefaultShellTimeout`, the
+OpenAI Responses API when no provider is named, and `llm.ResolveModel` to pick a model
+when none is given.
 
 Each conversation keeps its history in the provider's own wire format, so
 provider-specific content (such as reasoning blocks that must be sent back

@@ -1,8 +1,11 @@
 package llm
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Provider names accepted by New.
@@ -11,8 +14,13 @@ const (
 	ProviderOpenAI    = "openai"
 )
 
-// Config selects and configures a provider. It is what a config file or
-// environment maps onto.
+// DefaultMaxTokens caps output tokens per model call when Options.MaxTokens
+// is not set.
+const DefaultMaxTokens = 16000
+
+// Config selects and configures a provider. Only what is set here is used:
+// nothing is read from the environment, so callers decide where settings
+// come from (the CLI reads flags, environment and a config file).
 type Config struct {
 	// Provider is "openai" (the default: the OpenAI Responses API, which
 	// OpenAI and LLM proxies and gateways serve) or "anthropic" (the Anthropic
@@ -50,4 +58,38 @@ func DefaultModel(provider string) string {
 		return DefaultAnthropicModel
 	}
 	return ""
+}
+
+// ResolveModel returns model when it is set. Otherwise it returns the
+// provider's default model, or the endpoint's only model when it lists
+// exactly one; with several, the error names them, since the choice is the
+// caller's.
+func ResolveModel(ctx context.Context, p Provider, model string) (string, error) {
+	if model != "" {
+		return model, nil
+	}
+	if m := DefaultModel(p.Name()); m != "" {
+		return m, nil
+	}
+	ml, ok := p.(ModelLister)
+	if !ok {
+		return "", errors.New("llm: no model given")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	ids, err := ml.ListModels(ctx)
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("llm: no model given, and listing the endpoint's models failed: %w", err)
+	case len(ids) == 1:
+		return ids[0], nil
+	case len(ids) == 0:
+		return "", errors.New("llm: no model given and the endpoint lists none")
+	}
+	shown, more := ids, ""
+	if len(shown) > 30 {
+		shown = shown[:30]
+		more = fmt.Sprintf(" and %d more", len(ids)-len(shown))
+	}
+	return "", fmt.Errorf("llm: no model given; the endpoint offers %s%s", strings.Join(shown, ", "), more)
 }

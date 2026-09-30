@@ -52,14 +52,21 @@ type Event struct {
 // Recorder receives events as they happen. It must not block for long.
 type Recorder func(ctx context.Context, e Event)
 
+// Defaults for Config fields left zero.
+const (
+	DefaultMaxTurns      = 30
+	DefaultMaxToolOutput = 40000
+)
+
 // Config bounds a run.
 type Config struct {
-	// MaxTurns caps model calls per task or per Session.Send (default 30).
+	// MaxTurns caps model calls per task or per Session.Send
+	// (default DefaultMaxTurns).
 	MaxTurns int
 	// MaxToolOutput caps the bytes of one tool result sent to the model
-	// (default 40000). Longer output is saved with Spill when it is set, and
-	// the model gets its first and last lines plus where to find the rest;
-	// otherwise it is cut with a marker.
+	// (default DefaultMaxToolOutput). Longer output is saved with Spill
+	// when it is set, and the model gets its first and last lines plus
+	// where to find the rest; otherwise it is cut with a marker.
 	MaxToolOutput int
 	// Spill stores a tool result too large to send whole and returns a
 	// reference the model can use with its tools, such as a file path.
@@ -69,10 +76,10 @@ type Config struct {
 
 func (c Config) withDefaults() Config {
 	if c.MaxTurns <= 0 {
-		c.MaxTurns = 30
+		c.MaxTurns = DefaultMaxTurns
 	}
 	if c.MaxToolOutput <= 0 {
-		c.MaxToolOutput = 40000
+		c.MaxToolOutput = DefaultMaxToolOutput
 	}
 	return c
 }
