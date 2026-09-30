@@ -128,9 +128,10 @@ func TestRunWithTool(t *testing.T) {
 	if proxy.requests[0]["model"] != "proxy-model" || proxy.auth[0] != "Bearer sk-test" {
 		t.Fatalf("request = %v auth = %v", proxy.requests[0]["model"], proxy.auth[0])
 	}
-	tools := proxy.requests[0]["tools"].([]any)
-	if len(tools) != 4 {
-		t.Fatalf("tools offered = %d (shell must be off by default)", len(tools))
+	for _, tl := range proxy.requests[0]["tools"].([]any) {
+		if name := tl.(map[string]any)["function"].(map[string]any)["name"]; name == "shell" || name == "write_file" {
+			t.Fatalf("run offered %s by default", name)
+		}
 	}
 
 	out, _, err = run(t, nil, "run", "hello", "--model", "m", "--dir", dir, "--json")
@@ -151,6 +152,26 @@ func TestRunWithTool(t *testing.T) {
 		t.Fatalf("stdin out = %q, %v", out, err)
 	}
 
+	// Large piped input is saved to the session cache instead, and the cache
+	// is gone when the run ends.
+	cacheHome := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cacheHome)
+	r, w, _ = os.Pipe()
+	go func() {
+		for i := 1; i <= 5000; i++ {
+			fmt.Fprintf(w, "log line %d\n", i)
+		}
+		w.Close()
+	}()
+	out, _, err = run(t, r, "run", "summarize", "--model", "m", "--dir", dir)
+	if err != nil || !strings.Contains(out, "too large to include (68893 bytes, 5000 lines)") || !strings.Contains(out, "saved at "+cacheHome) ||
+		!strings.Contains(out, "It begins:\nlog line 1\n") || strings.Contains(out, "log line 5000") {
+		t.Fatalf("large stdin out = %q, %v", out, err)
+	}
+	if left, _ := os.ReadDir(filepath.Join(cacheHome, "senctl-agent", "sessions")); len(left) != 0 {
+		t.Fatalf("session cache left behind: %v", left)
+	}
+
 	if _, _, err := run(t, nil, "run", "x", "--dir", dir); err == nil || !strings.Contains(err.Error(), "no model") {
 		t.Fatalf("missing model err = %v", err)
 	}
@@ -166,6 +187,9 @@ func TestConsole(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	dir := workspace(t)
+	if err := os.WriteFile(filepath.Join(dir, "facts.md"), []byte("the sky is blue\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	saved := filepath.Join(t.TempDir(), "conv.md")
 	script := strings.Join([]string{
 		"/help",
@@ -180,6 +204,7 @@ func TestConsole(t *testing.T) {
 		"/tools",
 		"/effort high",
 		"/usage",
+		"what is in @facts.md?",
 		"/save " + saved,
 		"/clear",
 		"/bogus",
@@ -200,6 +225,7 @@ func TestConsole(t *testing.T) {
 		"edit is now off",
 		"Effort set to high.",
 		"input tokens 50, output tokens 10", // 5 model calls
+		"You said: what is in @facts.md?\n\n<file path=\"facts.md\">\nthe sky is blue\n</file>", // @mention
 		"Saved to " + saved,
 		"Started a new conversation.",
 		"Unknown command /bogus",

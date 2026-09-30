@@ -1,9 +1,9 @@
 // Package tools provides ready-made agent tools: read-only access to a
-// directory tree, and an opt-in shell.
+// directory tree that copes with files far larger than a model's context,
+// a read-only text pipeline, file editing, and an opt-in shell.
 package tools
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,17 +21,28 @@ import (
 
 const (
 	maxReadLines   = 2000
-	maxFileBytes   = 2 << 20
+	maxReadBytes   = 32000
+	maxLineBytes   = 2000
 	maxListEntries = 500
 	maxGrepMatches = 100
+	maxGrepLimit   = 500
+	maxGrepBytes   = 24000
+	maxGrepLine    = 400
+	maxGrepContext = 10
+	// largeFile is the size above which file_info suggests searching
+	// rather than reading.
+	largeFile = 256 << 10
 )
 
 // skipDirs are never walked by glob and grep.
 var skipDirs = map[string]bool{".git": true, "node_modules": true, "vendor": true, ".venv": true, "__pycache__": true}
 
-// Workspace serves read-only file tools confined to one directory.
+// Workspace serves read-only file tools confined to one directory, plus
+// any extra directories allowed for reading (such as a Cache).
 type Workspace struct {
-	root string
+	root  string
+	extra []string
+	idx   indexCache
 }
 
 // NewWorkspace roots the tools at dir.
@@ -50,13 +61,48 @@ func NewWorkspace(dir string) (*Workspace, error) {
 // Root is the workspace directory.
 func (w *Workspace) Root() string { return w.root }
 
-// resolve maps a model-supplied path to an absolute path inside the root,
-// following symlinks, and rejects anything that escapes it.
+// AllowRead lets the read-only tools also read files under dir, given by
+// absolute path. Editing stays confined to the workspace root.
+func (w *Workspace) AllowRead(dir string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return err
+	}
+	w.extra = append(w.extra, real)
+	return nil
+}
+
+func within(root, p string) bool {
+	return p == root || strings.HasPrefix(p, root+string(filepath.Separator))
+}
+
+// resolve maps a model-supplied path to an absolute path inside the root
+// (or an extra read root), following symlinks, and rejects anything that
+// escapes it.
 func (w *Workspace) resolve(p string) (string, error) {
 	if p == "" {
 		p = "."
 	}
 	if filepath.IsAbs(p) {
+		for _, root := range w.extra {
+			if clean := filepath.Clean(p); within(root, clean) {
+				real, err := filepath.EvalSymlinks(clean)
+				if errors.Is(err, fs.ErrNotExist) {
+					return "", fmt.Errorf("%s does not exist", p)
+				}
+				if err != nil {
+					return "", err
+				}
+				if !within(root, real) {
+					return "", fmt.Errorf("%s is outside the workspace", p)
+				}
+				return real, nil
+			}
+		}
 		rel, err := filepath.Rel(w.root, p)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return "", fmt.Errorf("%s is outside the workspace", p)
@@ -71,13 +117,34 @@ func (w *Workspace) resolve(p string) (string, error) {
 		}
 		return "", err
 	}
-	if real != w.root && !strings.HasPrefix(real, w.root+string(filepath.Separator)) {
+	if !within(w.root, real) {
 		return "", fmt.Errorf("%s is outside the workspace", p)
 	}
 	return real, nil
 }
 
+// resolveFile is resolve for a path that must be a file.
+func (w *Workspace) resolveFile(p string) (string, os.FileInfo, error) {
+	full, err := w.resolve(p)
+	if err != nil {
+		return "", nil, err
+	}
+	st, err := os.Stat(full)
+	if err != nil {
+		return "", nil, err
+	}
+	if st.IsDir() {
+		return "", nil, fmt.Errorf("%s is a directory; use list_dir", p)
+	}
+	return full, st, nil
+}
+
+// rel names a file for the model: relative to the workspace root, or
+// absolute when it lives in an extra read root.
 func (w *Workspace) rel(full string) string {
+	if !within(w.root, full) {
+		return full
+	}
 	r, err := filepath.Rel(w.root, full)
 	if err != nil {
 		return full
@@ -102,14 +169,19 @@ func decode[T any](raw json.RawMessage) (T, error) {
 	return v, nil
 }
 
-// Tools returns read_file, list_dir, glob and grep.
+// Tools returns read_file, file_info, list_dir, glob, grep and (when its
+// commands are installed) pipeline. Every path
+// is relative to the workspace, or absolute inside a directory allowed with
+// AllowRead.
 func (w *Workspace) Tools() []agent.Tool {
-	return []agent.Tool{
+	ts := []agent.Tool{
 		{
-			Spec: llm.ToolSpec{Name: "read_file", Description: "Read a text file in the workspace, with line numbers. Use offset and limit for large files.",
+			Spec: llm.ToolSpec{Name: "read_file", Description: fmt.Sprintf("Read a text file with line numbers, one page at a time: up to %d lines or about %d KB per call, with very long lines cut. "+
+				"offset is the first line (1-based); a negative offset counts from the end, so -100 reads the last 100 lines. The footer gives the file's line count and the offset of the next page. "+
+				"Files ending in .gz are decompressed. For large files, prefer grep or pipeline to find what matters, then read around it.", maxReadLines, maxReadBytes/1000),
 				Schema: object(map[string]any{
-					"path":   prop("string", "Path relative to the workspace"),
-					"offset": prop("integer", "First line, 1-based (default 1)"),
+					"path":   prop("string", "Path relative to the workspace, or an absolute path given by a tool"),
+					"offset": prop("integer", "First line, 1-based (default 1); negative counts from the end"),
 					"limit":  prop("integer", fmt.Sprintf("Number of lines (default and max %d)", maxReadLines)),
 				}, "path")},
 			Run: func(ctx context.Context, raw json.RawMessage) (string, error) {
@@ -120,11 +192,22 @@ func (w *Workspace) Tools() []agent.Tool {
 				if err != nil {
 					return "", err
 				}
-				return w.readFile(in.Path, in.Offset, in.Limit)
+				return w.readFile(ctx, in.Path, in.Offset, in.Limit)
 			},
 		},
 		{
-			Spec: llm.ToolSpec{Name: "list_dir", Description: "List a directory in the workspace (directories end with /).",
+			Spec: llm.ToolSpec{Name: "file_info", Description: "Describe a file without reading it all: size, line count, longest line, whether it is text, and its first and last lines. Use it before reading a file that may be large, such as a log.",
+				Schema: object(map[string]any{"path": prop("string", "Path relative to the workspace, or an absolute path given by a tool")}, "path")},
+			Run: func(ctx context.Context, raw json.RawMessage) (string, error) {
+				in, err := decode[struct{ Path string }](raw)
+				if err != nil {
+					return "", err
+				}
+				return w.fileInfo(ctx, in.Path)
+			},
+		},
+		{
+			Spec: llm.ToolSpec{Name: "list_dir", Description: "List a directory in the workspace with file sizes (directories end with /).",
 				Schema: object(map[string]any{"path": prop("string", "Directory relative to the workspace (default: the root)")})},
 			Run: func(ctx context.Context, raw json.RawMessage) (string, error) {
 				in, err := decode[struct{ Path string }](raw)
@@ -146,70 +229,33 @@ func (w *Workspace) Tools() []agent.Tool {
 			},
 		},
 		{
-			Spec: llm.ToolSpec{Name: "grep", Description: "Search file contents with a regular expression (RE2). Returns path:line:text.",
+			Spec: llm.ToolSpec{Name: "grep", Description: "Search file contents with a regular expression (RE2), streaming through files of any size (.gz files are decompressed). " +
+				"output_mode content (default) prints path:line:text, with context lines as path-line-text; files lists matching files; count prints matches per file. " +
+				"Results come in pages: the footer gives the total and the offset of the next page. On big files, start with count to size the result.",
 				Schema: object(map[string]any{
 					"pattern":     prop("string", "Regular expression"),
-					"path":        prop("string", "Directory or file to search (default: the root)"),
+					"path":        prop("string", "Directory or file to search (default: the root); absolute paths given by a tool work too"),
 					"include":     prop("string", "Only files whose path matches this glob, e.g. **/*.go"),
 					"ignore_case": prop("boolean", "Case-insensitive match"),
+					"output_mode": map[string]any{"type": "string", "enum": []string{"content", "files", "count"}, "description": "content (default), files or count"},
+					"context":     prop("integer", fmt.Sprintf("Lines of context before and after each match (content mode, max %d)", maxGrepContext)),
+					"offset":      prop("integer", "Skip this many results (for the next page)"),
+					"limit":       prop("integer", fmt.Sprintf("Results per page (default %d, max %d)", maxGrepMatches, maxGrepLimit)),
 				}, "pattern")},
 			Run: func(ctx context.Context, raw json.RawMessage) (string, error) {
-				in, err := decode[struct {
-					Pattern, Path, Include string
-					IgnoreCase             bool `json:"ignore_case"`
-				}](raw)
+				in, err := decode[grepInput](raw)
 				if err != nil {
 					return "", err
 				}
-				return w.grep(ctx, in.Pattern, in.Path, in.Include, in.IgnoreCase)
+				return w.grep(ctx, in)
 			},
 		},
 	}
+	if t, ok := w.pipelineTool(); ok {
+		ts = append(ts, t)
+	}
+	return ts
 }
-
-func (w *Workspace) readFile(p string, offset, limit int) (string, error) {
-	full, err := w.resolve(p)
-	if err != nil {
-		return "", err
-	}
-	st, err := os.Stat(full)
-	if err != nil {
-		return "", err
-	}
-	if st.IsDir() {
-		return "", fmt.Errorf("%s is a directory; use list_dir", p)
-	}
-	f, err := os.Open(full)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if offset < 1 {
-		offset = 1
-	}
-	if limit < 1 || limit > maxReadLines {
-		limit = maxReadLines
-	}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64<<10), 1<<20)
-	var b strings.Builder
-	n := 0
-	for sc.Scan() {
-		n++
-		if n >= offset && n < offset+limit {
-			if strings.ContainsRune(sc.Text(), 0) {
-				return "", fmt.Errorf("%s looks like a binary file", p)
-			}
-			fmt.Fprintf(&b, "%d: %s\n", n, sc.Text())
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return "", err
-	}
-	fmt.Fprintf(&b, "(%d lines in file)\n", n)
-	return b.String(), nil
-}
-
 func (w *Workspace) listDir(p string) (string, error) {
 	full, err := w.resolve(p)
 	if err != nil {
@@ -228,6 +274,8 @@ func (w *Workspace) listDir(p string) (string, error) {
 		name := e.Name()
 		if e.IsDir() {
 			name += "/"
+		} else if info, err := e.Info(); err == nil && info.Mode().IsRegular() {
+			name += "  " + humanBytes(info.Size())
 		}
 		b.WriteString(name + "\n")
 	}
@@ -327,58 +375,4 @@ func (w *Workspace) glob(ctx context.Context, pattern string) (string, error) {
 		out += fmt.Sprintf("\n[first %d matches; narrow the pattern]", maxListEntries)
 	}
 	return out, nil
-}
-
-func (w *Workspace) grep(ctx context.Context, pattern, p, include string, ignoreCase bool) (string, error) {
-	if ignoreCase {
-		pattern = "(?i)" + pattern
-	}
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return "", fmt.Errorf("invalid pattern: %v", err)
-	}
-	var inc *regexp.Regexp
-	if include != "" {
-		if inc, err = globRegexp(include); err != nil {
-			return "", fmt.Errorf("invalid include: %v", err)
-		}
-	}
-	start, err := w.resolve(p)
-	if err != nil {
-		return "", err
-	}
-	var b strings.Builder
-	matches := 0
-	err = w.walk(ctx, start, func(full, rel string) bool {
-		if inc != nil && !inc.MatchString(rel) {
-			return true
-		}
-		if st, err := os.Stat(full); err != nil || st.Size() > maxFileBytes {
-			return true
-		}
-		data, err := os.ReadFile(full)
-		if err != nil || strings.ContainsRune(string(data[:min(len(data), 8000)]), 0) {
-			return true
-		}
-		for i, line := range strings.Split(string(data), "\n") {
-			if re.MatchString(line) {
-				matches++
-				if matches > maxGrepMatches {
-					return false
-				}
-				fmt.Fprintf(&b, "%s:%d:%s\n", rel, i+1, line)
-			}
-		}
-		return true
-	})
-	if err != nil {
-		return "", err
-	}
-	if matches == 0 {
-		return "No matches.", nil
-	}
-	if matches > maxGrepMatches {
-		fmt.Fprintf(&b, "[first %d matches; narrow the search]\n", maxGrepMatches)
-	}
-	return b.String(), nil
 }

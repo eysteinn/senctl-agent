@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/eysteinn/senctl-agent/llm"
 )
@@ -56,8 +57,14 @@ type Config struct {
 	// MaxTurns caps model calls per task or per Session.Send (default 30).
 	MaxTurns int
 	// MaxToolOutput caps the bytes of one tool result sent to the model
-	// (default 20000); longer output is cut with a marker.
+	// (default 40000). Longer output is saved with Spill when it is set, and
+	// the model gets its first and last lines plus where to find the rest;
+	// otherwise it is cut with a marker.
 	MaxToolOutput int
+	// Spill stores a tool result too large to send whole and returns a
+	// reference the model can use with its tools, such as a file path.
+	// tools.Cache.Spill fits.
+	Spill func(ctx context.Context, tool, output string) (ref string, err error)
 }
 
 func (c Config) withDefaults() Config {
@@ -65,7 +72,7 @@ func (c Config) withDefaults() Config {
 		c.MaxTurns = 30
 	}
 	if c.MaxToolOutput <= 0 {
-		c.MaxToolOutput = 20000
+		c.MaxToolOutput = 40000
 	}
 	return c
 }
@@ -126,11 +133,70 @@ func (s *server) serve(ctx context.Context, call llm.ToolCall, submit string) (r
 	if submit != "" && call.Name == submit {
 		return llm.ToolResult{CallID: call.ID, Content: out}, true, nil
 	}
-	if len(out) > s.cfg.MaxToolOutput {
-		out = out[:s.cfg.MaxToolOutput] + fmt.Sprintf("\n[output cut at %d bytes; narrow the request]", s.cfg.MaxToolOutput)
-	}
+	out = s.fit(ctx, call.Name, out)
 	s.rec(ctx, Event{Kind: EventToolResult, Content: out})
 	return llm.ToolResult{CallID: call.ID, Content: out}, false, nil
+}
+
+// fit returns out as sent to the model: whole when it is small enough,
+// otherwise spilled (or cut) with a note.
+func (s *server) fit(ctx context.Context, tool, out string) string {
+	limit := s.cfg.MaxToolOutput
+	if len(out) <= limit {
+		return out
+	}
+	var ref string
+	var err error
+	if s.cfg.Spill != nil {
+		ref, err = s.cfg.Spill(ctx, tool, out)
+	}
+	if s.cfg.Spill == nil || err != nil {
+		note := fmt.Sprintf("\n[output cut at %d of %d bytes; narrow the request]", limit, len(out))
+		if err != nil {
+			s.rec(ctx, Event{Kind: EventNote, Content: "saving large tool output failed: " + err.Error()})
+		}
+		return head(out, limit) + note
+	}
+	lines := strings.Count(out, "\n")
+	if !strings.HasSuffix(out, "\n") {
+		lines++
+	}
+	top := head(out, limit*2/3)
+	bottom := tail(out, limit/4)
+	omitted := lines - strings.Count(top, "\n") - strings.Count(bottom, "\n")
+	return fmt.Sprintf("[This output is %d bytes (%d lines), too much to show whole. All of it is saved at %s: search it and read parts of it with your file tools instead of repeating the call. Its start and end follow.]\n%s\n[… %d lines not shown …]\n%s",
+		len(out), lines, ref, strings.TrimSuffix(top, "\n"), max(omitted, 0), bottom)
+}
+
+// head returns the start of s, at most n bytes, ending at a line break
+// when one is near.
+func head(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	if i := strings.LastIndexByte(s[:n], '\n'); i >= n/2 {
+		return s[:i+1]
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// tail returns the end of s, at most n bytes, starting after a line break
+// when one is near.
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	start := len(s) - n
+	if i := strings.IndexByte(s[start:], '\n'); i >= 0 && i < n/2 {
+		return s[start+i+1:]
+	}
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
 }
 
 func addUsage(total *llm.Usage, t *llm.Turn) {

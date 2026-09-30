@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -101,6 +102,36 @@ func TestRun(t *testing.T) {
 		}
 		if c := conv.sent[1].results[0].Content; !strings.HasPrefix(c, "xxxxxxxxxx\n[output cut") {
 			t.Fatalf("content = %q", c)
+		}
+	})
+
+	t.Run("long tool output is spilled", func(t *testing.T) {
+		var lines []string
+		for i := 1; i <= 1000; i++ {
+			lines = append(lines, fmt.Sprintf("line %d", i))
+		}
+		out := strings.Join(lines, "\n") + "\n"
+		big := Tool{Spec: llm.ToolSpec{Name: "big"}, Run: func(context.Context, json.RawMessage) (string, error) { return out, nil }}
+		conv := &scripted{turns: []*llm.Turn{
+			{ToolCalls: []llm.ToolCall{call("1", "big", `{}`)}},
+			{ToolCalls: []llm.ToolCall{call("2", "submit", `{"Answer":"a"}`)}},
+		}}
+		var saved string
+		spill := func(_ context.Context, tool, s string) (string, error) {
+			saved = s
+			return "/cache/" + tool + ".txt", nil
+		}
+		if _, _, err := Run(context.Background(), conv, "go", []Tool{big}, submit, Config{MaxToolOutput: 900, Spill: spill}, nil); err != nil {
+			t.Fatal(err)
+		}
+		c := conv.sent[1].results[0].Content
+		if saved != out || len(c) > 1200 {
+			t.Fatalf("saved %d bytes, sent %d", len(saved), len(c))
+		}
+		for _, want := range []string{"saved at /cache/big.txt", "(1000 lines)", "\nline 1\n", "\nline 1000\n", "lines not shown"} {
+			if !strings.Contains(c, want) {
+				t.Fatalf("missing %q in %q", want, c)
+			}
 		}
 	})
 
