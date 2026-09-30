@@ -98,9 +98,12 @@ In `run`, `ask` confirms on the terminal (`/dev/tty`), so it also works with pip
 ### Configuration
 
 Every setting is resolved the same way: a **flag** (`--base-url`), then its **environment
-variable** (`SENCTL_AGENT_BASE_URL`), then the **config file**
-(`$XDG_CONFIG_HOME/senctl-agent/config.yaml` or `./.senctl-agent.yaml`, keys in snake_case),
-then the default. `senctl-agent config` shows the result.
+variable** (`SENCTL_AGENT_BASE_URL`), then the **config file**, then the default;
+`senctl-agent config` shows the result. The config file is
+`$XDG_CONFIG_HOME/senctl-agent/config.yaml`, or the one named by `--config` /
+`SENCTL_AGENT_CONFIG` (keys in snake_case). A config file in the working directory is never
+read on its own: a repository you run the agent in could otherwise send your key and code to
+an endpoint of its choosing.
 
 ```yaml
 base_url: https://llm-proxy.example.com

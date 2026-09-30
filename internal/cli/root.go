@@ -45,7 +45,7 @@ first by default in the console) and optionally run shell commands (--shell).
 
 Configuration comes from flags, then environment variables (SENCTL_AGENT_BASE_URL,
 SENCTL_AGENT_API_KEY, SENCTL_AGENT_MODEL, …), then a config file
-($XDG_CONFIG_HOME/senctl-agent/config.yaml or ./.senctl-agent.yaml) with the same
+($XDG_CONFIG_HOME/senctl-agent/config.yaml, or --config / SENCTL_AGENT_CONFIG) with the same
 keys in snake_case. The API key falls back to OPENAI_API_KEY. To call the
 Anthropic API directly instead of a proxy, set provider to anthropic.`,
 		Args:         cobra.ArbitraryArgs,
