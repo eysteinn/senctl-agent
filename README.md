@@ -47,9 +47,9 @@ it: small text files are included, larger ones are described so the model can se
 
 | Command | |
 |---|---|
-| `/model [id]` | show the model (and the provider's models), or switch; the conversation continues |
+| `/model [id]` | list the provider's models (current one marked), or switch to a listed one; the conversation continues |
 | `/models` | list the provider's models |
-| `/effort [level]` | show or set reasoning effort (`low` … `max`) |
+| `/effort [level]` | list the reasoning effort levels, or set one (`none` … `max`, or `default` for the provider's) |
 | `/edit [off\|ask\|auto]` | file editing; `ask` shows a diff and asks `[y]es / [n]o / [a]lways` |
 | `/shell [off\|ask\|auto]` | shell commands; `ask` confirms each one |
 | `/tools` | tools the model can use right now |
