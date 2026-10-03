@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/go-viper/mapstructure/v2"
 
@@ -32,10 +33,13 @@ type Config struct {
 	MaxTurns  int    `mapstructure:"max_turns"`
 	MaxTokens int64  `mapstructure:"max_tokens"`
 	Fallbacks string `mapstructure:"fallbacks"`
-	System    string `mapstructure:"system"`
-	Dir       string `mapstructure:"dir"`
-	Shell     string `mapstructure:"shell"`
-	Edit      string `mapstructure:"edit"`
+	// RequestTimeout and MaxRetries map onto llm.Config; see there.
+	RequestTimeout time.Duration `mapstructure:"request_timeout"`
+	MaxRetries     int           `mapstructure:"max_retries"`
+	System         string        `mapstructure:"system"`
+	Dir            string        `mapstructure:"dir"`
+	Shell          string        `mapstructure:"shell"`
+	Edit           string        `mapstructure:"edit"`
 }
 
 // Environment variables the CLI reads besides SENCTL_AGENT_*, as viper keys.
@@ -65,12 +69,14 @@ func bindFlags(cmd *cobra.Command, v *viper.Viper) {
 	f.String("effort", "", "reasoning effort: low, medium, high")
 	f.Int("max-turns", agent.DefaultMaxTurns, "maximum model calls per prompt")
 	f.Int64("max-tokens", llm.DefaultMaxTokens, "maximum output tokens per model call")
+	f.Duration("request-timeout", llm.DefaultRequestTimeout, "give up on one model call after this long (it is then retried)")
+	f.Int("max-retries", llm.DefaultMaxRetries, "retries after a timeout, network error or 408/409/429/5xx answer (0 turns them off)")
 	f.String("system", "", "system prompt (replaces the default)")
 	f.String("dir", ".", "workspace directory the file tools can read")
 	f.String("shell", "off", "shell tool: off, ask (confirm each command) or auto")
 	f.String("edit", "", "file editing: off, ask (confirm each change) or auto (default: ask in the console, off for run)")
 	f.Bool("debug", false, "show the full error when a command fails")
-	for _, name := range []string{"debug", "api-key", "provider", "fallbacks", "base-url", "model", "effort", "max-turns", "max-tokens", "system", "dir", "shell", "edit"} {
+	for _, name := range []string{"debug", "api-key", "provider", "fallbacks", "base-url", "model", "effort", "max-turns", "max-tokens", "request-timeout", "max-retries", "system", "dir", "shell", "edit"} {
 		_ = v.BindPFlag(strings.ReplaceAll(name, "-", "_"), f.Lookup(name))
 	}
 	v.SetEnvPrefix("SENCTL_AGENT")
@@ -141,6 +147,12 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 	if _, err := c.fallbacks(); err != nil {
 		return nil, err
 	}
+	if c.RequestTimeout <= 0 {
+		return nil, configError{fmt.Errorf("request_timeout must be a positive duration such as 5m or 90s, not %s", c.RequestTimeout), settingHint("request_timeout")}
+	}
+	if c.MaxRetries < 0 {
+		return nil, configError{fmt.Errorf("max_retries must be 0 or more, not %d", c.MaxRetries), settingHint("max_retries")}
+	}
 	return &c, nil
 }
 
@@ -203,7 +215,9 @@ func (c *Config) provider(ctx context.Context) (llm.Provider, llm.Options, error
 	if err != nil {
 		return nil, llm.Options{}, err
 	}
-	p, err := llm.New(llm.Config{Provider: c.Provider, APIKey: c.APIKey, BaseURL: c.BaseURL, Fallbacks: fallbacks})
+	retries := c.MaxRetries
+	p, err := llm.New(llm.Config{Provider: c.Provider, APIKey: c.APIKey, BaseURL: c.BaseURL, Fallbacks: fallbacks,
+		RequestTimeout: c.RequestTimeout, MaxRetries: &retries})
 	if err != nil {
 		return nil, llm.Options{}, err
 	}

@@ -114,6 +114,8 @@ model: my-model       # optional if the proxy serves one model
 effort: high          # reasoning effort hint
 max_turns: 30         # model calls per prompt
 max_tokens: 16000     # output tokens per model call
+request_timeout: 5m    # give up on one model call after this long, then retry
+max_retries: 1        # retries after a timeout, network error or 408/409/429/5xx (0 = off)
 edit: ask             # off | ask | auto
 shell: off            # off | ask | auto
 provider: openai      # default; anthropic calls the Anthropic API directly
@@ -146,6 +148,16 @@ senctl-agent: no API key set
 
 `senctl-agent completion bash|zsh|fish|powershell` prints a shell completion script, e.g.
 `senctl-agent completion bash > ~/.local/share/bash-completion/completions/senctl-agent`.
+
+### Slow or stuck model calls
+
+Requests always stream, even for `run`, so a dead connection shows up within seconds while a
+reasoning model can still think silently for as long as it needs. A call is cut off when one
+attempt passes `request_timeout` (default 5 minutes), or when the reply's text has started and
+then nothing arrives for 60 seconds. It is then retried `max_retries` times (default once) after
+a timeout, a network error or a 408/409/429/5xx answer, honouring `Retry-After`, but only if none
+of its text reached you yet, so nothing is printed twice. Library users set the same with
+`llm.Config{RequestTimeout, IdleTimeout, MaxRetries}`.
 
 ## Library
 

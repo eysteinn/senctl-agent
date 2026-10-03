@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,11 +24,19 @@ type OpenAIConfig struct {
 	// without /v1 works too: when it answers 404, /v1 is tried and kept.
 	BaseURL    string
 	HTTPClient *http.Client
+	// RequestTimeout bounds one attempt (default DefaultRequestTimeout);
+	// IdleTimeout bounds silence once the reply's text has started (default
+	// DefaultIdleTimeout); MaxRetries is how often a failed attempt is
+	// repeated (nil: DefaultMaxRetries). See retryable.
+	RequestTimeout time.Duration
+	IdleTimeout    time.Duration
+	MaxRetries     *int
 }
 
 type openAIProvider struct {
-	cfg OpenAIConfig
-	mu  sync.Mutex
+	cfg    OpenAIConfig
+	timing timing
+	mu     sync.Mutex
 	// base is the API root in use; it gains /v1 when the configured root
 	// turns out to need it.
 	base string
@@ -40,9 +49,9 @@ func NewOpenAI(cfg OpenAIConfig) Provider {
 	}
 	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Minute}
+		cfg.HTTPClient = defaultHTTPClient()
 	}
-	return &openAIProvider{cfg: cfg, base: cfg.BaseURL}
+	return &openAIProvider{cfg: cfg, base: cfg.BaseURL, timing: resolveTiming(cfg.RequestTimeout, cfg.IdleTimeout, cfg.MaxRetries)}
 }
 
 func (p *openAIProvider) Name() string { return "openai" }
@@ -233,7 +242,9 @@ func (c *openAIConversation) post(ctx context.Context, stream bool) (*http.Respo
 	if res.StatusCode >= 300 {
 		defer res.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		return nil, fmt.Errorf("openai: %w", newAPIError(res.StatusCode, raw, c.p.cfg.APIKey == ""))
+		apiErr := newAPIError(res.StatusCode, raw, c.p.cfg.APIKey == "")
+		apiErr.RetryAfter = retryAfter(res.Header)
+		return nil, fmt.Errorf("openai: %w", apiErr)
 	}
 	return res, nil
 }
@@ -242,8 +253,9 @@ func (c *openAIConversation) Send(ctx context.Context, text string, results []To
 	return c.SendStream(ctx, text, results, nil)
 }
 
-// SendStream is Send over server-sent events, delivering text to onText as
-// it arrives. With onText nil the response comes in one piece.
+// SendStream is Send delivering text to onText as it arrives. Requests
+// always stream, so a dead connection is noticed while a reasoning model
+// is still thinking; with onText nil the text is just not forwarded.
 func (c *openAIConversation) SendStream(ctx context.Context, text string, results []ToolResult, onText func(string)) (*Turn, error) {
 	added := c.addUser(text, results)
 	turn, err := c.exchange(ctx, onText)
@@ -253,25 +265,41 @@ func (c *openAIConversation) SendStream(ctx context.Context, text string, result
 	return turn, err
 }
 
+// exchange makes the call, retrying failed attempts (see withRetries).
 func (c *openAIConversation) exchange(ctx context.Context, onText func(string)) (*Turn, error) {
-	res, err := c.post(ctx, onText != nil)
+	return withRetries(ctx, c.p.timing, func(ctx context.Context, delivered *bool) (*Turn, error) {
+		return c.attempt(ctx, func(s string) {
+			*delivered = true
+			if onText != nil {
+				onText(s)
+			}
+		})
+	})
+}
+
+// attempt makes one request, bounded by the request timeout and, once text
+// has started, the idle timeout.
+func (c *openAIConversation) attempt(ctx context.Context, emit func(string)) (*Turn, error) {
+	actx, idle, done := attemptContext(ctx, c.p.timing)
+	defer done()
+	res, err := c.post(actx, true)
 	if err != nil {
-		return nil, err
+		return nil, cause(actx, err)
 	}
 	defer res.Body.Close()
 	if !strings.Contains(res.Header.Get("Content-Type"), "text/event-stream") {
-		// Also taken when a server ignores stream=true.
+		// A server that ignores stream=true answers in one piece.
 		raw, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
 		if err != nil {
-			return nil, fmt.Errorf("openai: read response: %w", err)
+			return nil, fmt.Errorf("openai: read response: %w", cause(actx, err))
 		}
 		var r oaResponse
 		if err := json.Unmarshal(raw, &r); err != nil {
 			return nil, fmt.Errorf("openai: decode response: %s", snippet(raw))
 		}
 		turn, err := c.finish(&r)
-		if err == nil && onText != nil && turn.Text != "" {
-			onText(turn.Text)
+		if err == nil && turn.Text != "" {
+			emit(turn.Text)
 		}
 		return turn, err
 	}
@@ -280,6 +308,7 @@ func (c *openAIConversation) exchange(ctx context.Context, onText func(string)) 
 	// included.
 	sc.Buffer(make([]byte, 64<<10), 64<<20)
 	for sc.Scan() {
+		idle.touch()
 		data, ok := strings.CutPrefix(sc.Text(), "data:")
 		if !ok {
 			continue
@@ -295,8 +324,9 @@ func (c *openAIConversation) exchange(ctx context.Context, onText func(string)) 
 		}
 		switch ev.Type {
 		case "response.output_text.delta":
-			if onText != nil && ev.Delta != "" {
-				onText(ev.Delta)
+			idle.arm()
+			if ev.Delta != "" {
+				emit(ev.Delta)
 			}
 		case "response.completed", "response.incomplete", "response.failed":
 			if ev.Response == nil {
@@ -308,9 +338,12 @@ func (c *openAIConversation) exchange(ctx context.Context, onText func(string)) 
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("openai: read stream: %w", err)
+		return nil, fmt.Errorf("openai: read stream: %w", cause(actx, err))
 	}
-	return nil, fmt.Errorf("openai: the stream ended before the response was complete")
+	if err := context.Cause(actx); err != nil && errors.Is(err, ErrTimeout) {
+		return nil, fmt.Errorf("openai: %w", err)
+	}
+	return nil, fmt.Errorf("openai: %w", errIncomplete)
 }
 
 type oaResponse struct {

@@ -64,6 +64,10 @@ func explain(err error) (msg, hint string, code int) {
 		return err.Error(), cfg.hint, exitConfig
 	case errors.As(err, &llmCfg):
 		return strings.TrimPrefix(err.Error(), "llm: "), settingHint(llmSettings[llmCfg.Field]), exitConfig
+	case errors.Is(err, llm.ErrTimeout):
+		return "the model did not answer in time, even after retrying: " + strings.TrimPrefix(err.Error(), "llm: "),
+			"a slow model or high effort may need longer; raise --request-timeout, SENCTL_AGENT_REQUEST_TIMEOUT or request_timeout: in " + configFile(),
+			exitError
 	case errors.Is(err, llm.ErrNotAPI):
 		return fmt.Sprintf("the endpoint did not answer like an LLM API (%s)", apiErr),
 			settingHint("base_url") + "; it should be the API root, e.g. https://llm-proxy.example.com/v1",

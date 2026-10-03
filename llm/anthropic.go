@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -22,12 +23,18 @@ type AnthropicConfig struct {
 	// Fallbacks asks the API to re-serve a declined request on a fallback
 	// model inside the same call. Only the first-party API supports it.
 	Fallbacks bool
+	// RequestTimeout, IdleTimeout and MaxRetries work as in OpenAIConfig;
+	// the SDK applies the request timeout per attempt and the retries.
+	RequestTimeout time.Duration
+	IdleTimeout    time.Duration
+	MaxRetries     *int
 }
 
 type anthropicProvider struct {
 	client    anthropic.Client
 	fallbacks bool
 	keyless   bool
+	timing    timing
 }
 
 // NewAnthropic returns a provider backed by the official Anthropic SDK.
@@ -41,7 +48,9 @@ func NewAnthropic(cfg AnthropicConfig) Provider {
 	if cfg.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
 	}
-	return &anthropicProvider{client: anthropic.NewClient(opts...), fallbacks: cfg.Fallbacks, keyless: cfg.APIKey == ""}
+	t := resolveTiming(cfg.RequestTimeout, cfg.IdleTimeout, cfg.MaxRetries)
+	opts = append(opts, option.WithRequestTimeout(t.request), option.WithMaxRetries(t.retries))
+	return &anthropicProvider{client: anthropic.NewClient(opts...), fallbacks: cfg.Fallbacks, keyless: cfg.APIKey == "", timing: t}
 }
 
 // sdkError turns an error response from the SDK into an APIError and marks
@@ -71,7 +80,7 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]string, error) {
 }
 
 func (p *anthropicProvider) NewConversation(opts Options, system string, tools []ToolSpec) Conversation {
-	c := &anthropicConversation{client: &p.client, fallbacks: p.fallbacks, keyless: p.keyless, system: system}
+	c := &anthropicConversation{client: &p.client, fallbacks: p.fallbacks, keyless: p.keyless, system: system, idle: p.timing.idle}
 	c.SetOptions(opts)
 	c.SetTools(tools)
 	return c
@@ -79,6 +88,7 @@ func (p *anthropicProvider) NewConversation(opts Options, system string, tools [
 
 type anthropicConversation struct {
 	client    *anthropic.Client
+	idle      time.Duration // see AnthropicConfig.IdleTimeout
 	fallbacks bool
 	keyless   bool
 	system    string
@@ -173,21 +183,32 @@ func (c *anthropicConversation) SendStream(ctx context.Context, text string, res
 	if err := c.addUser(text, results); err != nil {
 		return nil, err
 	}
-	stream := c.client.Beta.Messages.NewStreaming(ctx, c.params(true))
+	// The SDK bounds each attempt; this cancels a reply whose text stopped
+	// arriving.
+	sctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	idle := &idleWatch{d: c.idle, cancel: cancel}
+	defer idle.stop()
+	stream := c.client.Beta.Messages.NewStreaming(sctx, c.params(true))
 	msg := anthropic.BetaMessage{}
 	for stream.Next() {
+		idle.touch()
 		ev := stream.Current()
 		if err := msg.Accumulate(ev); err != nil {
 			return nil, fmt.Errorf("anthropic: stream: %w", err)
 		}
 		if d, ok := ev.AsAny().(anthropic.BetaRawContentBlockDeltaEvent); ok && onText != nil {
 			if td, ok := d.Delta.AsAny().(anthropic.BetaTextDelta); ok {
+				idle.arm()
 				onText(td.Text)
 			}
 		}
 	}
 	if err := stream.Err(); err != nil {
 		c.messages = c.messages[:len(c.messages)-1]
+		if c := cause(sctx, err); errors.Is(c, ErrTimeout) {
+			return nil, fmt.Errorf("anthropic: %w", c)
+		}
 		return nil, fmt.Errorf("anthropic: %w", sdkError(err, c.keyless))
 	}
 	return c.finish(&msg)
