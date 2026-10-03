@@ -124,6 +124,27 @@ model is used; if it serves several, the error lists them. `OPENAI_API_KEY` (or
 `ANTHROPIC_API_KEY` with `provider: anthropic`) is used only when `api_key` is set nowhere
 else. `NO_COLOR` turns off colour in the console.
 
+### Errors, exit codes and completion
+
+Errors are one line on standard error, with a hint on the next when a setting would fix
+them; `--debug` adds the full underlying error.
+
+```
+$ senctl-agent run "hi"
+senctl-agent: no API key set
+  set SENCTL_AGENT_API_KEY, api_key: in ~/.config/senctl-agent/config.yaml or --api-key (OPENAI_API_KEY and ANTHROPIC_API_KEY work too)
+```
+
+| Exit code | |
+|---|---|
+| 0 | success |
+| 1 | the command failed |
+| 2 | bad arguments or flags |
+| 3 | settings missing or wrong: no or a rejected API key, unreachable endpoint, no model, bad config file |
+
+`senctl-agent completion bash|zsh|fish|powershell` prints a shell completion script, e.g.
+`senctl-agent completion bash > ~/.local/share/bash-completion/completions/senctl-agent`.
+
 ## Library
 
 ```go
@@ -168,6 +189,12 @@ zero value get the same defaults the CLI uses: `llm.DefaultMaxTokens`,
 `agent.DefaultMaxTurns`, `agent.DefaultMaxToolOutput`, `tools.DefaultShellTimeout`, the
 OpenAI Responses API when no provider is named, and `llm.ResolveModel` to pick a model
 when none is given.
+
+Errors can be told apart with `errors.Is`, whichever provider failed: `llm.ErrNoAPIKey`
+(`llm.New` for a first-party API without a key, or HTTP 401/403 to a request sent without
+one), `llm.ErrUnauthorized` (HTTP 401/403), `llm.ErrUnreachable` (no connection could be
+made) and `llm.ErrNoModel` (from `llm.ResolveModel`). Error responses are `*llm.APIError`,
+with the status code and the API's own message.
 
 Each conversation keeps its history in the provider's own wire format, so
 provider-specific content (such as reasoning blocks that must be sent back

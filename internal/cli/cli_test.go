@@ -361,3 +361,60 @@ func TestNoWorkingDirectoryConfig(t *testing.T) {
 		t.Fatalf("SENCTL_AGENT_CONFIG: out = %q, err = %v", out, err)
 	}
 }
+
+func TestErrorReport(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, "{\n  \"error\": {\n    \"message\": \"Missing bearer authentication in header\",\n    \"type\": \"invalid_request_error\"\n  }\n}")
+	}))
+	defer srv.Close()
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+	models := httptest.NewServer(&fakeProxy{})
+	defer models.Close()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("SENCTL_AGENT_API_KEY", "")
+
+	for _, tt := range []struct {
+		name string
+		args []string
+		code int
+		want string
+	}{
+		{"no key", []string{"run", "x", "--base-url", srv.URL}, exitConfig,
+			"senctl-agent: no API key set\n  set SENCTL_AGENT_API_KEY, api_key: in "},
+		{"no key, no base URL", []string{"run", "x"}, exitConfig, "senctl-agent: no API key set\n"},
+		{"rejected key", []string{"run", "x", "--base-url", srv.URL, "--api-key", "bad"}, exitConfig,
+			"senctl-agent: the endpoint rejected the API key (HTTP 401: Missing bearer authentication in header)\n  check SENCTL_AGENT_API_KEY"},
+		{"unreachable", []string{"run", "x", "--base-url", closed.URL, "--api-key", "k"}, exitConfig,
+			"senctl-agent: cannot reach " + closed.URL + ": dial tcp"},
+		{"several models", []string{"run", "x", "--base-url", models.URL, "--api-key", "k"}, exitConfig,
+			"senctl-agent: no model given; the endpoint offers alpha, beta\n  set --model, SENCTL_AGENT_MODEL or model: in the config file ('senctl-agent models' lists them)\n"},
+		{"unknown flag", []string{"run", "x", "--nope"}, exitUsage,
+			"senctl-agent: unknown flag: --nope\n  run 'senctl-agent run --help' for usage\n"},
+		{"bad setting", []string{"run", "x", "--shell", "sometimes"}, exitConfig,
+			"senctl-agent: --shell must be off, ask or auto\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, stderr, err := run(t, nil, tt.args...)
+			if err == nil {
+				t.Fatal("no error")
+			}
+			if stderr != "" {
+				t.Errorf("cobra printed %q itself", stderr)
+			}
+			var b bytes.Buffer
+			if code := report(&b, err, false); code != tt.code || !strings.HasPrefix(b.String(), tt.want) {
+				t.Errorf("report = %d\n%s\nwant %d\n%s", code, b.String(), tt.code, tt.want)
+			}
+		})
+	}
+
+	_, _, err := run(t, nil, "run", "x", "--base-url", srv.URL)
+	var b bytes.Buffer
+	report(&b, err, true)
+	if !strings.Contains(b.String(), "\n  error: llm: no model given, and listing the endpoint's models failed: openai: list models: HTTP 401: ") {
+		t.Errorf("debug report lacks the full error:\n%s", b.String())
+	}
+}

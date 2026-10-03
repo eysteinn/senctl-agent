@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -27,9 +28,23 @@ var Version = "dev"
 const defaultSystem = `You are a careful software assistant working in a directory on the user's machine (%s).
 Use the tools provided to look things up instead of guessing; the available tools can change during the conversation. Files can be far larger than you can read at once: for logs and other big files, check the size with file_info, find what matters with grep or pipeline, then read around it. Output too large to show whole is saved to a file you can search the same way. Before changing a file, read it. Keep changes minimal and explain what you changed. Quote the files you rely on, answer concisely, and say when you are unsure.`
 
-// NewRootCmd builds the senctl-agent command tree.
-func NewRootCmd() *cobra.Command {
+// Execute runs the command line in os.Args, writes any error to standard
+// error and returns the process exit code.
+func Execute() int {
 	v := viper.New()
+	root := newRootCmd(v)
+	err := root.Execute()
+	if err == nil {
+		return exitOK
+	}
+	return report(root.ErrOrStderr(), err, v.GetBool("debug"))
+}
+
+// NewRootCmd builds the senctl-agent command tree. Its errors are returned,
+// not printed; Execute prints them.
+func NewRootCmd() *cobra.Command { return newRootCmd(viper.New()) }
+
+func newRootCmd(v *viper.Viper) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "senctl-agent [prompt]",
 		Short: "A tool-using LLM agent for the terminal",
@@ -48,12 +63,16 @@ SENCTL_AGENT_API_KEY, SENCTL_AGENT_MODEL, …), then a config file
 ($XDG_CONFIG_HOME/senctl-agent/config.yaml, or --config / SENCTL_AGENT_CONFIG) with the same
 keys in snake_case. The API key falls back to OPENAI_API_KEY. To call the
 Anthropic API directly instead of a proxy, set provider to anthropic.`,
-		Args:         cobra.ArbitraryArgs,
-		SilenceUsage: true,
+		Args:          cobra.ArbitraryArgs,
+		SilenceUsage:  true,
+		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runConsole(cmd, v, strings.TrimSpace(strings.Join(args, " ")))
 		},
 	}
+	root.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
+		return usageError{err, cmd.CommandPath()}
+	})
 	bindFlags(root, v)
 	root.AddCommand(newRunCmd(v), newChatCmd(v), newConfigCmd(v), newModelsCmd(v), &cobra.Command{
 		Use:   "version",
@@ -222,7 +241,7 @@ File editing and shell access are off unless --edit / --shell say otherwise.`,
 				stdin = in
 			}
 			if prompt == "" && stdin == nil {
-				return fmt.Errorf("give a prompt as an argument or on standard input")
+				return usageError{errors.New("give a prompt as an argument or on standard input"), cmd.CommandPath()}
 			}
 			e, err := setup(cmd, v)
 			if err != nil {
@@ -235,7 +254,7 @@ File editing and shell access are off unless --edit / --shell say otherwise.`,
 				}
 			}
 			if prompt == "" {
-				return fmt.Errorf("give a prompt as an argument or on standard input")
+				return usageError{errors.New("give a prompt as an argument or on standard input"), cmd.CommandPath()}
 			}
 			if e.cfg.Edit == "" {
 				e.cfg.Edit = modeOff

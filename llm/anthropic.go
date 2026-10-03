@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -26,6 +27,7 @@ type AnthropicConfig struct {
 type anthropicProvider struct {
 	client    anthropic.Client
 	fallbacks bool
+	keyless   bool
 }
 
 // NewAnthropic returns a provider backed by the official Anthropic SDK.
@@ -39,7 +41,17 @@ func NewAnthropic(cfg AnthropicConfig) Provider {
 	if cfg.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
 	}
-	return &anthropicProvider{client: anthropic.NewClient(opts...), fallbacks: cfg.Fallbacks}
+	return &anthropicProvider{client: anthropic.NewClient(opts...), fallbacks: cfg.Fallbacks, keyless: cfg.APIKey == ""}
+}
+
+// sdkError turns an error response from the SDK into an APIError and marks
+// connection failures as ErrUnreachable.
+func sdkError(err error, keyless bool) error {
+	var e *anthropic.Error
+	if errors.As(err, &e) {
+		return newAPIError(e.StatusCode, []byte(e.RawJSON()), keyless)
+	}
+	return markUnreachable(err)
 }
 
 func (p *anthropicProvider) Name() string { return "anthropic" }
@@ -52,14 +64,14 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]string, error) {
 		ids = append(ids, pager.Current().ID)
 	}
 	if err := pager.Err(); err != nil {
-		return nil, fmt.Errorf("anthropic: list models: %w", err)
+		return nil, fmt.Errorf("anthropic: list models: %w", sdkError(err, p.keyless))
 	}
 	sort.Strings(ids)
 	return ids, nil
 }
 
 func (p *anthropicProvider) NewConversation(opts Options, system string, tools []ToolSpec) Conversation {
-	c := &anthropicConversation{client: &p.client, fallbacks: p.fallbacks, system: system}
+	c := &anthropicConversation{client: &p.client, fallbacks: p.fallbacks, keyless: p.keyless, system: system}
 	c.SetOptions(opts)
 	c.SetTools(tools)
 	return c
@@ -68,6 +80,7 @@ func (p *anthropicProvider) NewConversation(opts Options, system string, tools [
 type anthropicConversation struct {
 	client    *anthropic.Client
 	fallbacks bool
+	keyless   bool
 	system    string
 	opts      Options
 	tools     []ToolSpec
@@ -149,7 +162,7 @@ func (c *anthropicConversation) Send(ctx context.Context, text string, results [
 	resp, err := c.client.Beta.Messages.New(ctx, c.params(false))
 	if err != nil {
 		c.messages = c.messages[:len(c.messages)-1]
-		return nil, fmt.Errorf("anthropic: %w", err)
+		return nil, fmt.Errorf("anthropic: %w", sdkError(err, c.keyless))
 	}
 	return c.finish(resp)
 }
@@ -175,7 +188,7 @@ func (c *anthropicConversation) SendStream(ctx context.Context, text string, res
 	}
 	if err := stream.Err(); err != nil {
 		c.messages = c.messages[:len(c.messages)-1]
-		return nil, fmt.Errorf("anthropic: %w", err)
+		return nil, fmt.Errorf("anthropic: %w", sdkError(err, c.keyless))
 	}
 	return c.finish(&msg)
 }

@@ -64,7 +64,8 @@ func bindFlags(cmd *cobra.Command, v *viper.Viper) {
 	f.String("dir", ".", "workspace directory the file tools can read")
 	f.String("shell", "off", "shell tool: off, ask (confirm each command) or auto")
 	f.String("edit", "", "file editing: off, ask (confirm each change) or auto (default: ask in the console, off for run)")
-	for _, name := range []string{"api-key", "provider", "fallbacks", "base-url", "model", "effort", "max-turns", "max-tokens", "system", "dir", "shell", "edit"} {
+	f.Bool("debug", false, "show the full error when a command fails")
+	for _, name := range []string{"debug", "api-key", "provider", "fallbacks", "base-url", "model", "effort", "max-turns", "max-tokens", "system", "dir", "shell", "edit"} {
 		_ = v.BindPFlag(strings.ReplaceAll(name, "-", "_"), f.Lookup(name))
 	}
 	v.SetEnvPrefix("SENCTL_AGENT")
@@ -75,6 +76,14 @@ func bindFlags(cmd *cobra.Command, v *viper.Viper) {
 	_ = v.BindEnv(keyNoColor, "NO_COLOR")
 	_ = v.BindEnv(keyStateHome, "XDG_STATE_HOME")
 	_ = v.BindEnv(keyConfigFile, "SENCTL_AGENT_CONFIG")
+}
+
+// configFile is the user config file's path, for messages.
+func configFile() string {
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "senctl-agent", "config.yaml")
+	}
+	return "the config file"
 }
 
 // load reads the config file (if any) and returns the effective config.
@@ -88,7 +97,7 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 	if path != "" {
 		v.SetConfigFile(path)
 		if err := v.ReadInConfig(); err != nil {
-			return nil, fmt.Errorf("read config %s: %w", path, err)
+			return nil, configError{fmt.Errorf("read config %s: %w", path, err)}
 		}
 	} else {
 		v.SetConfigName("config")
@@ -98,7 +107,7 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 		}
 		if err := v.ReadInConfig(); err != nil {
 			if _, notFound := err.(viper.ConfigFileNotFoundError); !notFound {
-				return nil, fmt.Errorf("read config: %w", err)
+				return nil, configError{fmt.Errorf("read config: %w", err)}
 			}
 		}
 		if _, err := os.Stat(localConfig); err == nil {
@@ -107,7 +116,7 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 	}
 	var c Config
 	if err := v.Unmarshal(&c); err != nil {
-		return nil, fmt.Errorf("config: %w", err)
+		return nil, configError{fmt.Errorf("config: %w", err)}
 	}
 	c.Provider = strings.ToLower(strings.TrimSpace(c.Provider))
 	if c.APIKey == "" {
@@ -121,7 +130,7 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 		switch v {
 		case "", "off", "ask", "auto":
 		default:
-			return nil, fmt.Errorf("--%s must be off, ask or auto", name)
+			return nil, configError{fmt.Errorf("--%s must be off, ask or auto", name)}
 		}
 	}
 	return &c, nil
@@ -145,7 +154,7 @@ func (c *Config) provider(ctx context.Context) (llm.Provider, llm.Options, error
 	}
 	model, err := llm.ResolveModel(ctx, p, c.Model)
 	if err != nil {
-		return nil, llm.Options{}, fmt.Errorf("%w; set --model, SENCTL_AGENT_MODEL or model: in the config file (senctl-agent models lists them)", err)
+		return nil, llm.Options{}, err
 	}
 	c.Model = model
 	return p, llm.Options{Model: c.Model, Effort: c.Effort, MaxTokens: c.MaxTokens}, nil
