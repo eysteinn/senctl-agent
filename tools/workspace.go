@@ -49,14 +49,50 @@ type Workspace struct {
 func NewWorkspace(dir string) (*Workspace, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
-		return nil, err
+		return nil, &WorkspaceError{dir, err}
 	}
 	real, err := filepath.EvalSymlinks(abs)
 	if err != nil {
-		return nil, err
+		return nil, &WorkspaceError{dir, err}
+	}
+	f, err := os.Open(real)
+	if err != nil {
+		return nil, &WorkspaceError{dir, err}
+	}
+	st, err := f.Stat()
+	f.Close()
+	if err == nil && !st.IsDir() {
+		err = ErrNotDir
+	}
+	if err != nil {
+		return nil, &WorkspaceError{dir, err}
 	}
 	return &Workspace{root: real}, nil
 }
+
+// ErrNotDir: the workspace path is not a directory.
+var ErrNotDir = errors.New("not a directory")
+
+// WorkspaceError reports a workspace directory that cannot be used. Err
+// matches fs.ErrNotExist, fs.ErrPermission or ErrNotDir when that is why.
+type WorkspaceError struct {
+	Dir string
+	Err error
+}
+
+func (e *WorkspaceError) Error() string {
+	switch {
+	case errors.Is(e.Err, fs.ErrNotExist):
+		return fmt.Sprintf("workspace %s does not exist", e.Dir)
+	case errors.Is(e.Err, ErrNotDir):
+		return fmt.Sprintf("workspace %s is not a directory", e.Dir)
+	case errors.Is(e.Err, fs.ErrPermission):
+		return fmt.Sprintf("workspace %s cannot be read: permission denied", e.Dir)
+	}
+	return fmt.Sprintf("workspace %s: %v", e.Dir, e.Err)
+}
+
+func (e *WorkspaceError) Unwrap() error { return e.Err }
 
 // Root is the workspace directory.
 func (w *Workspace) Root() string { return w.root }

@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,5 +106,30 @@ func TestShell(t *testing.T) {
 	deny := Shell(dir, time.Second, func(string) bool { return false })
 	if _, err := call(t, deny, map[string]any{"command": "echo hi"}); err == nil || !strings.Contains(err.Error(), "declined") {
 		t.Fatalf("declined err = %v", err)
+	}
+}
+
+func TestNewWorkspaceErrors(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "file.txt")
+	if err := os.WriteFile(file, []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		dir    string
+		target error
+		msg    string
+	}{
+		{filepath.Join(dir, "missing"), fs.ErrNotExist, "does not exist"},
+		{file, ErrNotDir, "is not a directory"},
+	} {
+		_, err := NewWorkspace(tt.dir)
+		var we *WorkspaceError
+		if !errors.As(err, &we) || !errors.Is(err, tt.target) || err.Error() != "workspace "+tt.dir+" "+tt.msg {
+			t.Errorf("NewWorkspace(%s) = %v", tt.dir, err)
+		}
+	}
+	if _, err := NewWorkspace(dir); err != nil {
+		t.Errorf("NewWorkspace(dir) = %v", err)
 	}
 }

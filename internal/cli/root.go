@@ -71,7 +71,7 @@ Anthropic API directly instead of a proxy, set provider to anthropic.`,
 		},
 	}
 	root.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
-		return usageError{err, cmd.CommandPath()}
+		return usageError{flagError(err), cmd.CommandPath()}
 	})
 	bindFlags(root, v)
 	root.AddCommand(newRunCmd(v), newChatCmd(v), newConfigCmd(v), newModelsCmd(v), &cobra.Command{
@@ -119,13 +119,14 @@ func setup(cmd *cobra.Command, v *viper.Viper) (*env, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Local settings first: they fail fast, the endpoint may not.
+	ws, err := tools.NewWorkspace(cfg.Dir)
+	if err != nil {
+		return nil, configError{err, settingHint("dir") + " (default: the current directory)"}
+	}
 	p, opts, err := cfg.provider(cmd.Context())
 	if err != nil {
 		return nil, err
-	}
-	ws, err := tools.NewWorkspace(cfg.Dir)
-	if err != nil {
-		return nil, fmt.Errorf("workspace: %w", err)
 	}
 	cache, err := newCache()
 	if err != nil {
@@ -185,10 +186,15 @@ func isTerminal(f any) bool {
 }
 
 // ttyApprove asks on the controlling terminal, for one-shot runs.
-func ttyApprove() (func(question string) bool, error) {
+func ttyApprove(settings []string) (func(question string) bool, error) {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
-		return nil, fmt.Errorf("\"ask\" needs a terminal to confirm actions: %w", err)
+		verb := "needs"
+		if len(settings) > 1 {
+			verb = "need"
+		}
+		return nil, configError{fmt.Errorf("--%s ask %s a terminal to confirm with, and there is none", strings.Join(settings, " ask and --"), verb),
+			"use auto or off when running without a terminal"}
 	}
 	return func(question string) bool {
 		fmt.Fprintf(tty, "\n%s\n[y/N] ", question)
@@ -202,10 +208,16 @@ func ttyApprove() (func(question string) bool, error) {
 func (e *env) runTools() ([]agent.Tool, error) {
 	ts := e.ws.Tools()
 	var ask func(string) bool
-	needAsk := e.cfg.Shell == modeAsk || e.cfg.Edit == modeAsk
-	if needAsk {
+	var asking []string
+	if e.cfg.Edit == modeAsk {
+		asking = append(asking, "edit")
+	}
+	if e.cfg.Shell == modeAsk {
+		asking = append(asking, "shell")
+	}
+	if len(asking) > 0 {
 		var err error
-		if ask, err = ttyApprove(); err != nil {
+		if ask, err = ttyApprove(asking); err != nil {
 			return nil, err
 		}
 	}

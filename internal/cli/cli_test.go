@@ -385,6 +385,24 @@ func TestErrorReport(t *testing.T) {
 	closed.Close()
 	models := httptest.NewServer(&fakeProxy{})
 	defer models.Close()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error": {"message": "The model `+"`gpt-nope`"+` does not exist or you do not have access to it.", "type": "invalid_request_error", "code": "model_not_found"}}`)
+	}))
+	defer api.Close()
+	web := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, "<!DOCTYPE html>\n<html><head><title>404 Not Found</title></head><body>nope</body></html>")
+	}))
+	defer web.Close()
+	tmp := t.TempDir()
+	file := filepath.Join(tmp, "file.txt")
+	badType := filepath.Join(tmp, "bad.yaml")
+	for name, content := range map[string]string{file: "hi\n", badType: "max_turns: lots\n"} {
+		if err := os.WriteFile(name, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("SENCTL_AGENT_API_KEY", "")
@@ -403,11 +421,31 @@ func TestErrorReport(t *testing.T) {
 		{"unreachable", []string{"run", "x", "--base-url", closed.URL, "--api-key", "k"}, exitConfig,
 			"senctl-agent: cannot reach " + closed.URL + ": dial tcp"},
 		{"several models", []string{"run", "x", "--base-url", models.URL, "--api-key", "k"}, exitConfig,
-			"senctl-agent: no model given; the endpoint offers alpha, beta\n  set --model, SENCTL_AGENT_MODEL or model: in the config file ('senctl-agent models' lists them)\n"},
+			"senctl-agent: no model given; the endpoint offers alpha, beta\n  set --model, SENCTL_AGENT_MODEL or model: in "},
+		{"unknown model", []string{"run", "x", "--base-url", api.URL, "--api-key", "k", "--model", "gpt-nope"}, exitConfig,
+			"senctl-agent: the endpoint does not serve this model (HTTP 404: The model `gpt-nope` does not exist or you do not have access to it.)\n  check --model, SENCTL_AGENT_MODEL or model: in "},
+		{"web page", []string{"run", "x", "--base-url", web.URL, "--api-key", "k", "--model", "m"}, exitConfig,
+			"senctl-agent: the endpoint did not answer like an LLM API (HTTP 404: a web page (\"404 Not Found\"), not an API response)\n  check --base-url, "},
+		{"base URL without scheme", []string{"run", "x", "--base-url", "proxy.example.com", "--model", "m"}, exitConfig,
+			"senctl-agent: base URL \"proxy.example.com\" must be an http:// or https:// address\n  check --base-url, SENCTL_AGENT_BASE_URL or base_url: in "},
+		{"unknown provider", []string{"run", "x", "--provider", "gemini", "--api-key", "k"}, exitConfig,
+			"senctl-agent: unknown provider \"gemini\"; use openai or anthropic\n  check --provider, "},
+		{"bad fallbacks", []string{"run", "x", "--fallbacks", "maybe"}, exitConfig,
+			"senctl-agent: fallbacks must be true or false, not \"maybe\"\n  check --fallbacks, "},
+		{"missing workspace", []string{"run", "x", "--dir", filepath.Join(tmp, "missing"), "--model", "m"}, exitConfig,
+			"senctl-agent: workspace " + filepath.Join(tmp, "missing") + " does not exist\n  check --dir, "},
+		{"workspace is a file", []string{"run", "x", "--dir", file, "--model", "m"}, exitConfig,
+			"senctl-agent: workspace " + file + " is not a directory\n  check --dir, "},
+		{"missing config file", []string{"run", "x", "--config", filepath.Join(tmp, "nope.yaml")}, exitConfig,
+			"senctl-agent: config file " + filepath.Join(tmp, "nope.yaml") + " does not exist\n  check --config or SENCTL_AGENT_CONFIG\n"},
+		{"wrong type in config file", []string{"run", "x", "--config", badType}, exitConfig,
+			"senctl-agent: max_turns must be a whole number, not \"lots\"\n  check --max-turns, SENCTL_AGENT_MAX_TURNS or max_turns: in "},
+		{"bad flag value", []string{"run", "x", "--max-turns", "lots"}, exitUsage,
+			"senctl-agent: invalid argument \"lots\" for \"--max-turns\" flag: not a whole number\n  run 'senctl-agent run --help' for usage\n"},
 		{"unknown flag", []string{"run", "x", "--nope"}, exitUsage,
 			"senctl-agent: unknown flag: --nope\n  run 'senctl-agent run --help' for usage\n"},
 		{"bad setting", []string{"run", "x", "--shell", "sometimes"}, exitConfig,
-			"senctl-agent: --shell must be off, ask or auto\n"},
+			"senctl-agent: shell must be off, ask or auto, not \"sometimes\"\n  check --shell, SENCTL_AGENT_SHELL or shell: in "},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, stderr, err := run(t, nil, tt.args...)

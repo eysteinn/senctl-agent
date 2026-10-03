@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/anthropics/anthropic-sdk-go v1.76.0
 	github.com/ergochat/readline v0.1.3
+	github.com/go-viper/mapstructure/v2 v2.4.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 )
@@ -13,7 +14,6 @@ require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
-	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
