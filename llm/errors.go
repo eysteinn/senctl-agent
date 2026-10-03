@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Errors callers can test for with errors.Is, whichever provider failed.
@@ -53,6 +54,9 @@ type APIError struct {
 	// Code is the API's machine-readable error code (OpenAI's error.code,
 	// else the error type), or "".
 	Code string
+	// RetryAfter is how long the server asked to wait before retrying
+	// (Retry-After, in seconds), or 0.
+	RetryAfter time.Duration
 	// keyless records that the request carried no API key.
 	keyless bool
 	// html records that the body was a web page, not an API error.

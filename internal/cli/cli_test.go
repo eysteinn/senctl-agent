@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/eysteinn/senctl-agent/llm"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -532,5 +533,36 @@ func TestConsoleSpillNotice(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("console output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestRequestTimingSettings(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfgDir)
+	if err := os.MkdirAll(filepath.Join(cfgDir, "senctl-agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "senctl-agent", "config.yaml"), []byte("max_retries: 3\nrequest_timeout: 2m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SENCTL_AGENT_REQUEST_TIMEOUT", "90s")
+	out, _, err := run(t, nil, "config")
+	if err != nil || !strings.Contains(out, "request_timeout: 1m30s") || !strings.Contains(out, "max_retries: 3") {
+		t.Fatalf("config: %v\n%s", err, out)
+	}
+	if out, _, _ := run(t, nil, "config", "--max-retries", "0", "--request-timeout", "10m"); !strings.Contains(out, "max_retries: 0") || !strings.Contains(out, "request_timeout: 10m0s") {
+		t.Fatalf("flags: %s", out)
+	}
+	for _, args := range [][]string{{"--max-retries", "-1"}, {"--request-timeout", "0s"}} {
+		if _, _, err := run(t, nil, append([]string{"config"}, args...)...); err == nil {
+			t.Errorf("%v accepted", args)
+		}
+	}
+}
+
+func TestTimeoutIsExplained(t *testing.T) {
+	msg, hint, code := explain(fmt.Errorf("openai: %w: no complete response within 5m0s", llm.ErrTimeout))
+	if code != exitError || !strings.Contains(msg, "did not answer in time") || !strings.Contains(hint, "--request-timeout") {
+		t.Fatalf("msg %q hint %q code %d", msg, hint, code)
 	}
 }

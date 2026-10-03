@@ -404,8 +404,8 @@ func newConfigCmd(v *viper.Viper) *cobra.Command {
 			if file == "" {
 				file = "(none)"
 			}
-			fmt.Fprintf(out, "config file: %s\nprovider:    %s\nbase_url:    %s\nmodel:       %s\napi_key:     %s\neffort:      %s\nmax_turns:   %d\nmax_tokens:  %d\ndir:         %s\nshell:       %s\nedit:        %s\n",
-				file, orDefault(c.Provider, "openai (default)"), c.BaseURL, c.Model, mask(c.APIKey), c.Effort, c.MaxTurns, c.MaxTokens, c.Dir, c.Shell, orDefault(c.Edit, "(ask in the console, off for run)"))
+			fmt.Fprintf(out, "config file: %s\nprovider:    %s\nbase_url:    %s\nmodel:       %s\napi_key:     %s\neffort:      %s\nmax_turns:   %d\nmax_tokens:  %d\nrequest_timeout: %s\nmax_retries: %d\ndir:         %s\nshell:       %s\nedit:        %s\n",
+				file, orDefault(c.Provider, "openai (default)"), c.BaseURL, c.Model, mask(c.APIKey), c.Effort, c.MaxTurns, c.MaxTokens, c.RequestTimeout, c.MaxRetries, c.Dir, c.Shell, orDefault(c.Edit, "(ask in the console, off for run)"))
 			return nil
 		},
 	}

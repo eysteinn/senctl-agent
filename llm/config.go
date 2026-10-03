@@ -33,6 +33,16 @@ type Config struct {
 	// Fallbacks (anthropic) asks the API to re-serve a declined request on
 	// a fallback model. Nil means on for the first-party API (no BaseURL).
 	Fallbacks *bool
+	// RequestTimeout bounds one attempt at a model call (default
+	// DefaultRequestTimeout). IdleTimeout bounds silence once the reply's
+	// text has started (default DefaultIdleTimeout); before that a reasoning
+	// model may send nothing for a long time. MaxRetries is how often a
+	// call is retried after a timeout, a network error or a 408/409/429/5xx
+	// answer, if none of its text reached the caller yet (nil:
+	// DefaultMaxRetries; 0 turns retries off).
+	RequestTimeout time.Duration
+	IdleTimeout    time.Duration
+	MaxRetries     *int
 }
 
 // New builds the provider described by cfg. Without a BaseURL it talks to
@@ -59,9 +69,11 @@ func New(cfg Config) (Provider, error) {
 		if cfg.Fallbacks != nil {
 			fallbacks = *cfg.Fallbacks
 		}
-		return NewAnthropic(AnthropicConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, Fallbacks: fallbacks}), nil
+		return NewAnthropic(AnthropicConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, Fallbacks: fallbacks,
+			RequestTimeout: cfg.RequestTimeout, IdleTimeout: cfg.IdleTimeout, MaxRetries: cfg.MaxRetries}), nil
 	}
-	return NewOpenAI(OpenAIConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL}), nil
+	return NewOpenAI(OpenAIConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL,
+		RequestTimeout: cfg.RequestTimeout, IdleTimeout: cfg.IdleTimeout, MaxRetries: cfg.MaxRetries}), nil
 }
 
 // DefaultModel is the model used when none is configured, or "" when the
