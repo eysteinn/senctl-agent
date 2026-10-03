@@ -73,8 +73,11 @@ func (p *openAIProvider) do(ctx context.Context, method, path string, body []byt
 		return p.cfg.HTTPClient.Do(req)
 	}
 	res, err := send(base)
-	if err != nil || res.StatusCode != http.StatusNotFound || strings.HasSuffix(base, "/v1") {
-		return res, err
+	if err != nil {
+		return nil, markUnreachable(err)
+	}
+	if res.StatusCode != http.StatusNotFound || strings.HasSuffix(base, "/v1") {
+		return res, nil
 	}
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	res.Body.Close()
@@ -117,7 +120,7 @@ func (p *openAIProvider) ListModels(ctx context.Context) ([]string, error) {
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 	if res.StatusCode >= 300 {
-		return nil, fmt.Errorf("openai: list models: HTTP %d: %s", res.StatusCode, snippet(raw))
+		return nil, fmt.Errorf("openai: list models: %w", newAPIError(res.StatusCode, raw, p.cfg.APIKey == ""))
 	}
 	var out struct {
 		Data []struct {
@@ -230,11 +233,7 @@ func (c *openAIConversation) post(ctx context.Context, stream bool) (*http.Respo
 	if res.StatusCode >= 300 {
 		defer res.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		msg := apiError(raw)
-		if msg == "" {
-			msg = snippet(raw)
-		}
-		return nil, fmt.Errorf("openai: HTTP %d: %s", res.StatusCode, msg)
+		return nil, fmt.Errorf("openai: %w", newAPIError(res.StatusCode, raw, c.p.cfg.APIKey == ""))
 	}
 	return res, nil
 }

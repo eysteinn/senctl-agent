@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/eysteinn/senctl-agent/agent"
 	"github.com/eysteinn/senctl-agent/llm"
@@ -30,7 +31,11 @@ func Example_session() {
 // A task that must end in a structured result, submitted through a tool
 // whose Run validates it.
 func Example_run() {
-	provider, _ := llm.New(llm.Config{Provider: "anthropic"}) // uses ANTHROPIC_API_KEY
+	// The library reads no environment: the caller passes the key.
+	provider, err := llm.New(llm.Config{Provider: "anthropic", APIKey: os.Getenv("ANTHROPIC_API_KEY")})
+	if err != nil {
+		log.Fatal(err) // llm.ErrNoAPIKey when the variable is unset
+	}
 	type verdict struct {
 		Label  string `json:"label"`
 		Reason string `json:"reason"`

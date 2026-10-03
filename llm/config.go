@@ -2,7 +2,6 @@ package llm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -35,10 +34,19 @@ type Config struct {
 	Fallbacks *bool
 }
 
-// New builds the provider described by cfg.
+// New builds the provider described by cfg. Without a BaseURL it talks to
+// the provider's own API, which needs an APIKey: without one it returns
+// ErrNoAPIKey. A proxy may work without a key, so it is not checked then.
 func New(cfg Config) (Provider, error) {
-	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
-	case ProviderOpenAI, "":
+	name := strings.ToLower(strings.TrimSpace(cfg.Provider))
+	if name == "" {
+		name = ProviderOpenAI
+	}
+	if cfg.APIKey == "" && cfg.BaseURL == "" && (name == ProviderOpenAI || name == ProviderAnthropic) {
+		return nil, fmt.Errorf("%w: the %s API needs one", ErrNoAPIKey, name)
+	}
+	switch name {
+	case ProviderOpenAI:
 		return NewOpenAI(OpenAIConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL}), nil
 	case ProviderAnthropic:
 		fallbacks := cfg.BaseURL == ""
@@ -73,23 +81,23 @@ func ResolveModel(ctx context.Context, p Provider, model string) (string, error)
 	}
 	ml, ok := p.(ModelLister)
 	if !ok {
-		return "", errors.New("llm: no model given")
+		return "", ErrNoModel
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	ids, err := ml.ListModels(ctx)
 	switch {
 	case err != nil:
-		return "", fmt.Errorf("llm: no model given, and listing the endpoint's models failed: %w", err)
+		return "", fmt.Errorf("%w, and listing the endpoint's models failed: %w", ErrNoModel, err)
 	case len(ids) == 1:
 		return ids[0], nil
 	case len(ids) == 0:
-		return "", errors.New("llm: no model given and the endpoint lists none")
+		return "", fmt.Errorf("%w and the endpoint lists none", ErrNoModel)
 	}
 	shown, more := ids, ""
 	if len(shown) > 30 {
 		shown = shown[:30]
 		more = fmt.Sprintf(" and %d more", len(ids)-len(shown))
 	}
-	return "", fmt.Errorf("llm: no model given; the endpoint offers %s%s", strings.Join(shown, ", "), more)
+	return "", fmt.Errorf("%w; the endpoint offers %s%s", ErrNoModel, strings.Join(shown, ", "), more)
 }

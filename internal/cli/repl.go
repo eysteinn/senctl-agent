@@ -395,7 +395,11 @@ func (c *console) send(ctx context.Context, text string) {
 		c.printf("%s\n", c.st.dim("(cancelled)"))
 		return
 	case err != nil:
-		c.printf("%s\n", c.st.red("error: "+err.Error()))
+		msg, hint, _ := explain(err)
+		c.printf("%s\n", c.st.red("error: "+msg))
+		if hint != "" {
+			c.printf("%s\n", c.st.dim(hint))
+		}
 		return
 	}
 	if !streamed && strings.TrimSpace(answer) != "" {
