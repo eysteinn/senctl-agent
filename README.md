@@ -86,7 +86,9 @@ Nothing is ever read whole into the model's context:
 - Tool output too long for the context (over 40 KB) is saved in full to a session cache
   directory (`$XDG_CACHE_HOME/senctl-agent/sessions/…`, removed on exit). The model sees the
   first and last lines plus the file's path, and searches it with the same tools. So does
-  large piped input to `run`.
+  large piped input to `run`. The console shows this under the tool call
+  (`↳ pipeline output is 128 KB (3000 lines), too large to send whole: saved to …`), and
+  `run -v` prints it as a `spill` line.
 
 | Setting | Console default | `run` default |
 |---|---|---|

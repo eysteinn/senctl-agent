@@ -271,6 +271,8 @@ func (c *console) recorder() agent.Recorder {
 			c.printf("%s %s %s\n", c.st.accent("⏺"), c.st.bold(name), c.st.dim(oneLine(args, 120)))
 		case agent.EventToolError:
 			c.printf("  %s\n", c.st.red("✗ "+oneLine(e.Content, 200)))
+		case agent.EventSpill, agent.EventNote:
+			c.printf("  %s\n", c.st.dim("↳ "+tildePath(e.Content)))
 		}
 	}
 }

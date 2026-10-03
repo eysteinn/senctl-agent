@@ -153,8 +153,18 @@ func recorder(w io.Writer, verbose bool) agent.Recorder {
 			fmt.Fprintf(w, "· %s: %s\n", e.Kind, oneLine(e.Content, 200))
 		case agent.EventModelText:
 			fmt.Fprintf(w, "· %s\n", oneLine(e.Content, 200))
+		case agent.EventSpill, agent.EventNote:
+			fmt.Fprintf(w, "· %s: %s\n", e.Kind, oneLine(e.Content, 400))
 		}
 	}
+}
+
+// tildePath shortens paths under the home directory in s to ~/….
+func tildePath(s string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "/" {
+		return strings.ReplaceAll(s, home+string(os.PathSeparator), "~"+string(os.PathSeparator))
+	}
+	return s
 }
 
 func oneLine(s string, n int) string {

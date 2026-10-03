@@ -40,7 +40,10 @@ const (
 	EventToolCall   = "tool_call"
 	EventToolResult = "tool_result"
 	EventToolError  = "tool_error"
-	EventNote       = "note"
+	// EventSpill: a tool's output was too large to send whole and was saved
+	// with Config.Spill; the model sees its start and end.
+	EventSpill = "spill"
+	EventNote  = "note"
 )
 
 // Event is one step of an agent run, for observability.
@@ -168,6 +171,8 @@ func (s *server) fit(ctx context.Context, tool, out string) string {
 	if !strings.HasSuffix(out, "\n") {
 		lines++
 	}
+	s.rec(ctx, Event{Kind: EventSpill, Content: fmt.Sprintf("%s output is %d KB (%d lines), too large to send whole: saved to %s; the model sees its start and end",
+		tool, (len(out)+1023)/1024, lines, ref)})
 	top := head(out, limit*2/3)
 	bottom := tail(out, limit/4)
 	omitted := lines - strings.Count(top, "\n") - strings.Count(bottom, "\n")
