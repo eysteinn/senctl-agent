@@ -28,7 +28,12 @@ const (
 
 var modes = []string{modeOff, modeAsk, modeAuto}
 
-var efforts = []string{"low", "medium", "high", "xhigh", "max"}
+// efforts are the reasoning effort levels /effort accepts, lowest first.
+// Providers support different subsets; the request fails on one it lacks.
+var efforts = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+// effortDefault clears the effort, leaving the provider's default.
+const effortDefault = "default"
 
 // style colours terminal output; zero value prints plain text.
 type style struct{ on bool }
@@ -69,9 +74,9 @@ type console struct {
 
 var commandHelp = [][2]string{
 	{"/help", "show this help"},
-	{"/model [id]", "show or switch the model (lists models when the provider can)"},
+	{"/model [id]", "list the models, or switch to one; the conversation continues"},
 	{"/models", "list the provider's models"},
-	{"/effort [level]", "show or set reasoning effort: " + strings.Join(efforts, ", ")},
+	{"/effort [level]", "list the reasoning effort levels, or set one (" + effortDefault + " for the provider's)"},
 	{"/shell [off|ask|auto]", "show or set shell access"},
 	{"/edit [off|ask|auto]", "show or set file editing"},
 	{"/tools", "list the tools the model can use"},
@@ -91,12 +96,15 @@ func (c *console) completer() readline.AutoCompleter {
 		return out
 	}
 	var effortItems []*readline.PrefixCompleter
-	for _, e := range efforts {
+	for _, e := range append([]string{effortDefault}, efforts...) {
 		effortItems = append(effortItems, readline.PcItem(e))
 	}
 	return readline.NewPrefixCompleter(
 		readline.PcItem("/help"),
-		readline.PcItem("/model", readline.PcItemDynamic(func(string) []string { return c.models(context.Background()) })),
+		readline.PcItem("/model", readline.PcItemDynamic(func(string) []string {
+			ids, _ := c.models(context.Background())
+			return ids
+		})),
 		readline.PcItem("/models"),
 		readline.PcItem("/effort", effortItems...),
 		readline.PcItem("/shell", modeItems()...),
@@ -111,19 +119,77 @@ func (c *console) completer() readline.AutoCompleter {
 	)
 }
 
-// models lists the provider's models, or nil when it cannot.
-func (c *console) models(ctx context.Context) []string {
+// errNoListing: the provider cannot list its models.
+var errNoListing = errors.New("this provider does not list its models")
+
+// models lists the provider's models.
+func (c *console) models(ctx context.Context) ([]string, error) {
 	l, ok := c.env.provider.(llm.ModelLister)
 	if !ok {
-		return nil
+		return nil, errNoListing
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	ids, err := l.ListModels(ctx)
-	if err != nil {
-		return nil
+	return l.ListModels(ctx)
+}
+
+// listModels prints the provider's models with the current one marked, or
+// why they cannot be listed.
+func (c *console) listModels(ctx context.Context) {
+	ids, err := c.models(ctx)
+	switch {
+	case err != nil:
+		msg, _, _ := explain(err)
+		c.printf("%s\n", c.st.dim("Cannot list models: "+msg))
+	case len(ids) == 0:
+		c.printf("%s\n", c.st.dim("The provider lists no models."))
+	default:
+		c.printModels(ids)
 	}
-	return ids
+}
+
+// switchModel switches to model when the provider lists it. When the
+// models cannot be listed it switches anyway: the next message tells.
+func (c *console) switchModel(ctx context.Context, model string) {
+	if model == c.opts.Model {
+		c.printf("Already using %s.\n", c.st.bold(model))
+		return
+	}
+	ids, err := c.models(ctx)
+	switch {
+	case err == nil && !contains(ids, model):
+		c.printf("%s\n", c.st.red("Unknown model "+model+"; the provider offers:"))
+		c.printModels(ids)
+		return
+	case err != nil:
+		msg, _, _ := explain(err)
+		c.printf("%s\n", c.st.dim("Cannot check the model ("+msg+"); switching anyway."))
+	}
+	c.opts.Model = model
+	c.session.SetOptions(c.opts)
+	c.printf("Switched to %s. The conversation continues.\n", c.st.bold(model))
+}
+
+// setEffort lists the effort levels, or sets one.
+func (c *console) setEffort(level string) {
+	cur := orDefault(c.opts.Effort, effortDefault)
+	if level == "" {
+		c.printf("Effort: %s\n", c.st.bold(cur))
+		c.printList(append([]string{effortDefault}, efforts...), cur)
+		return
+	}
+	level = strings.ToLower(level)
+	if level != effortDefault && !contains(efforts, level) {
+		c.printf("%s\n", c.st.red("Unknown effort "+level+"; use "+effortDefault+", "+strings.Join(efforts, ", ")+"."))
+		return
+	}
+	if level == effortDefault {
+		c.opts.Effort = ""
+	} else {
+		c.opts.Effort = level
+	}
+	c.session.SetOptions(c.opts)
+	c.printf("Effort set to %s.\n", level)
 }
 
 func (c *console) printf(format string, a ...any) { fmt.Fprintf(c.out, format, a...) }
@@ -263,29 +329,14 @@ func (c *console) command(ctx context.Context, line string) bool {
 	case "/model":
 		if arg == "" {
 			c.printf("Model: %s\n", c.st.bold(c.opts.Model))
-			if ids := c.models(ctx); len(ids) > 0 {
-				c.printModels(ids)
-			}
+			c.listModels(ctx)
 			return true
 		}
-		c.opts.Model = arg
-		c.session.SetOptions(c.opts)
-		c.printf("Switched to %s. The conversation continues.\n", c.st.bold(arg))
+		c.switchModel(ctx, arg)
 	case "/models":
-		ids := c.models(ctx)
-		if len(ids) == 0 {
-			c.printf("%s\n", c.st.dim("This provider did not list its models."))
-			return true
-		}
-		c.printModels(ids)
+		c.listModels(ctx)
 	case "/effort":
-		if arg == "" {
-			c.printf("Effort: %s\n", orDefault(c.opts.Effort, "default"))
-			return true
-		}
-		c.opts.Effort = arg
-		c.session.SetOptions(c.opts)
-		c.printf("Effort set to %s.\n", arg)
+		c.setEffort(arg)
 	case "/shell", "/edit":
 		cur := &c.shell
 		if name == "/edit" {
@@ -336,11 +387,17 @@ func (c *console) command(ctx context.Context, line string) bool {
 	return true
 }
 
+// printModels prints the models sorted, marking the current one.
 func (c *console) printModels(ids []string) {
 	sort.Strings(ids)
-	for _, id := range ids {
+	c.printList(ids, c.opts.Model)
+}
+
+// printList prints items in order, marking cur.
+func (c *console) printList(items []string, cur string) {
+	for _, id := range items {
 		mark := "  "
-		if id == c.opts.Model {
+		if id == cur {
 			mark = c.st.accent("● ")
 		}
 		c.printf("  %s%s\n", mark, id)

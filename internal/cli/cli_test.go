@@ -213,6 +213,7 @@ func TestConsole(t *testing.T) {
 	script := strings.Join([]string{
 		"/help",
 		"/model",
+		"/model nope",
 		"/model alpha",
 		"hello \\",
 		"there",
@@ -221,6 +222,8 @@ func TestConsole(t *testing.T) {
 		"read the notes",
 		"/edit off",
 		"/tools",
+		"/effort",
+		"/effort extreme",
 		"/effort high",
 		"/usage",
 		"what is in @facts.md?",
@@ -236,12 +239,15 @@ func TestConsole(t *testing.T) {
 	for _, want := range []string{
 		"/model [id]",               // help
 		"Model: m", "alpha", "beta", // model listing
-		"Switched to alpha",              // model switch
-		"You said: hello \nthere",        // continued line, streamed reply
-		"Create file? hello.txt", "+ hi", // edit approval with preview
+		"Unknown model nope; the provider offers:", // unlisted model refused
+		"Switched to alpha",                        // model switch
+		"You said: hello \nthere",                  // continued line, streamed reply
+		"Create file? hello.txt", "+ hi",           // edit approval with preview
 		"The tool says: Created hello.txt (1 line).",
 		"The tool says: 1: deploy on fridays",
 		"edit is now off",
+		"Effort: default", "minimal", "xhigh", // effort listing
+		"Unknown effort extreme",
 		"Effort set to high.",
 		"input tokens 50, output tokens 10", // 5 model calls
 		"You said: what is in @facts.md?\n\n<file path=\"facts.md\">\nthe sky is blue\n</file>", // @mention
@@ -259,6 +265,11 @@ func TestConsole(t *testing.T) {
 	// Requests after /model alpha use the new model and stream.
 	if proxy.requests[0]["model"] != "alpha" || proxy.requests[0]["stream"] != true {
 		t.Fatalf("first request = %v %v", proxy.requests[0]["model"], proxy.requests[0]["stream"])
+	}
+	// Requests after /effort high carry it.
+	last := proxy.requests[len(proxy.requests)-1]
+	if r, _ := last["reasoning"].(map[string]any); r["effort"] != "high" {
+		t.Fatalf("last request reasoning = %v", last["reasoning"])
 	}
 	toolNames := func(req map[string]any) string {
 		var names []string
@@ -416,5 +427,39 @@ func TestErrorReport(t *testing.T) {
 	report(&b, err, true)
 	if !strings.Contains(b.String(), "\n  error: llm: no model given, and listing the endpoint's models failed: openai: list models: HTTP 401: ") {
 		t.Errorf("debug report lacks the full error:\n%s", b.String())
+	}
+}
+
+// When the provider cannot list its models, /model says why and switches
+// without checking; /effort default goes back to the provider's default.
+func TestConsoleUnlistedModels(t *testing.T) {
+	proxy := &fakeProxy{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			http.NotFound(w, r)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	script := "/model\n/model m\n/model other\n/effort low\n/effort default\nhi\n/exit\n"
+	out, stderr, err := run(t, strings.NewReader(script), "--base-url", srv.URL, "--model", "m", "--dir", workspace(t))
+	if err != nil {
+		t.Fatalf("console: %v %s", err, stderr)
+	}
+	for _, want := range []string{
+		"Model: m\nCannot list models: openai: list models: HTTP 404: 404 page not found",
+		"Already using m.",
+		"Cannot check the model (openai: list models: HTTP 404: 404 page not found); switching anyway.\nSwitched to other.",
+		"Effort set to default.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("console output missing %q:\n%s", want, out)
+		}
+	}
+	if len(proxy.requests) != 1 || proxy.requests[0]["model"] != "other" || proxy.requests[0]["reasoning"] != nil {
+		t.Fatalf("requests = %v", proxy.requests)
 	}
 }
