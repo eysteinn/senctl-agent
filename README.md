@@ -195,8 +195,13 @@ when none is given.
 Errors can be told apart with `errors.Is`, whichever provider failed: `llm.ErrNoAPIKey`
 (`llm.New` for a first-party API without a key, or HTTP 401/403 to a request sent without
 one), `llm.ErrUnauthorized` (HTTP 401/403), `llm.ErrUnreachable` (no connection could be
-made) and `llm.ErrNoModel` (from `llm.ResolveModel`). Error responses are `*llm.APIError`,
-with the status code and the API's own message.
+made), `llm.ErrNoModel` (from `llm.ResolveModel`), `llm.ErrModelNotFound` (the endpoint does
+not serve the model) and `llm.ErrNotAPI` (a web page instead of an API response, usually a
+wrong base URL). Error responses are `*llm.APIError`, with the status code, the API's own
+message and its error code. `llm.New` returns a `*llm.ConfigError` for an unknown provider or
+a base URL that is not an http(s) address, and `tools.NewWorkspace` a `*tools.WorkspaceError`
+for a directory that does not exist (`fs.ErrNotExist`), is a file (`tools.ErrNotDir`) or
+cannot be read (`fs.ErrPermission`).
 
 Each conversation keeps its history in the provider's own wire format, so
 provider-specific content (such as reasoning blocks that must be sent back

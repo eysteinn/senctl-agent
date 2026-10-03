@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -42,20 +43,25 @@ func New(cfg Config) (Provider, error) {
 	if name == "" {
 		name = ProviderOpenAI
 	}
-	if cfg.APIKey == "" && cfg.BaseURL == "" && (name == ProviderOpenAI || name == ProviderAnthropic) {
+	if name != ProviderOpenAI && name != ProviderAnthropic {
+		return nil, &ConfigError{Field: "Provider", Msg: fmt.Sprintf("unknown provider %q; use %s or %s", cfg.Provider, ProviderOpenAI, ProviderAnthropic)}
+	}
+	if cfg.BaseURL != "" {
+		if u, err := url.Parse(cfg.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, &ConfigError{Field: "BaseURL", Msg: fmt.Sprintf("base URL %q must be an http:// or https:// address", cfg.BaseURL)}
+		}
+	}
+	if cfg.APIKey == "" && cfg.BaseURL == "" {
 		return nil, fmt.Errorf("%w: the %s API needs one", ErrNoAPIKey, name)
 	}
-	switch name {
-	case ProviderOpenAI:
-		return NewOpenAI(OpenAIConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL}), nil
-	case ProviderAnthropic:
+	if name == ProviderAnthropic {
 		fallbacks := cfg.BaseURL == ""
 		if cfg.Fallbacks != nil {
 			fallbacks = *cfg.Fallbacks
 		}
 		return NewAnthropic(AnthropicConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, Fallbacks: fallbacks}), nil
 	}
-	return nil, fmt.Errorf("llm: unknown provider %q (openai or anthropic)", cfg.Provider)
+	return NewOpenAI(OpenAIConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL}), nil
 }
 
 // DefaultModel is the model used when none is configured, or "" when the

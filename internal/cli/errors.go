@@ -27,11 +27,24 @@ type usageError struct {
 func (e usageError) Error() string { return e.err.Error() }
 func (e usageError) Unwrap() error { return e.err }
 
-// configError is a config file or setting that cannot be used.
-type configError struct{ err error }
+// configError is a config file or setting that cannot be used, with a
+// hint on where to fix it.
+type configError struct {
+	err  error
+	hint string
+}
 
 func (e configError) Error() string { return e.err.Error() }
 func (e configError) Unwrap() error { return e.err }
+
+// settingHint names the places setting key (snake_case) can be set.
+func settingHint(key string) string {
+	return fmt.Sprintf("check --%s, SENCTL_AGENT_%s or %s: in %s",
+		strings.ReplaceAll(key, "_", "-"), strings.ToUpper(key), key, configFile())
+}
+
+// llmSettings maps llm.ConfigError fields to settings.
+var llmSettings = map[string]string{"Provider": "provider", "BaseURL": "base_url"}
 
 // explain turns err into a message for a person, a hint on how to fix it
 // when the fix is a setting, and an exit code.
@@ -41,13 +54,24 @@ func explain(err error) (msg, hint string, code int) {
 		urlErr *url.Error
 		usage  usageError
 		cfg    configError
+		llmCfg *llm.ConfigError
 	)
 	errors.As(err, &apiErr)
 	switch {
 	case errors.As(err, &usage):
 		return err.Error(), fmt.Sprintf("run '%s --help' for usage", usage.cmdPath), exitUsage
 	case errors.As(err, &cfg):
-		return err.Error(), "", exitConfig
+		return err.Error(), cfg.hint, exitConfig
+	case errors.As(err, &llmCfg):
+		return strings.TrimPrefix(err.Error(), "llm: "), settingHint(llmSettings[llmCfg.Field]), exitConfig
+	case errors.Is(err, llm.ErrNotAPI):
+		return fmt.Sprintf("the endpoint did not answer like an LLM API (%s)", apiErr),
+			settingHint("base_url") + "; it should be the API root, e.g. https://llm-proxy.example.com/v1",
+			exitConfig
+	case errors.Is(err, llm.ErrModelNotFound):
+		return fmt.Sprintf("the endpoint does not serve this model (%s)", apiErr),
+			settingHint("model") + " ('senctl-agent models' lists them)",
+			exitConfig
 	case errors.Is(err, llm.ErrNoAPIKey):
 		return "no API key set",
 			"set SENCTL_AGENT_API_KEY, api_key: in " + configFile() + " or --api-key (OPENAI_API_KEY and ANTHROPIC_API_KEY work too)",
@@ -63,9 +87,9 @@ func explain(err error) (msg, hint string, code int) {
 				msg = fmt.Sprintf("cannot reach %s://%s: %v", u.Scheme, u.Host, urlErr.Err)
 			}
 		}
-		return msg, "check --base-url, SENCTL_AGENT_BASE_URL or base_url: in the config file", exitConfig
+		return msg, settingHint("base_url"), exitConfig
 	case errors.Is(err, llm.ErrNoModel):
-		hint = "set --model, SENCTL_AGENT_MODEL or model: in the config file"
+		hint = "set --model, SENCTL_AGENT_MODEL or model: in " + configFile()
 		if apiErr == nil {
 			hint += " ('senctl-agent models' lists them)"
 		}
@@ -79,12 +103,31 @@ func explain(err error) (msg, hint string, code int) {
 // when the message leaves part of it out.
 func report(w io.Writer, err error, debug bool) int {
 	msg, hint, code := explain(err)
-	fmt.Fprintf(w, "senctl-agent: %s\n", msg)
+	fmt.Fprintf(w, "senctl-agent: %s\n", tildePath(msg))
 	if hint != "" {
-		fmt.Fprintf(w, "  %s\n", hint)
+		fmt.Fprintf(w, "  %s\n", tildePath(hint))
 	}
 	if debug && msg != err.Error() {
 		fmt.Fprintf(w, "  error: %v\n", err)
 	}
 	return code
+}
+
+// flagError drops Go's parser detail from a bad flag value:
+// invalid argument "lots" for "--max-turns" flag: strconv.ParseInt: … becomes
+// invalid argument "lots" for "--max-turns" flag: not a whole number.
+func flagError(err error) error {
+	msg := err.Error()
+	i := strings.Index(msg, ": strconv.Parse")
+	if i < 0 {
+		return err
+	}
+	want := "not a number"
+	switch {
+	case strings.HasPrefix(msg[i:], ": strconv.ParseInt"), strings.HasPrefix(msg[i:], ": strconv.ParseUint"):
+		want = "not a whole number"
+	case strings.HasPrefix(msg[i:], ": strconv.ParseBool"):
+		want = "not true or false"
+	}
+	return errors.New(msg[:i] + ": " + want)
 }

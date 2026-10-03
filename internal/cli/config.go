@@ -2,10 +2,15 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+
+	"github.com/go-viper/mapstructure/v2"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -97,7 +102,7 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 	if path != "" {
 		v.SetConfigFile(path)
 		if err := v.ReadInConfig(); err != nil {
-			return nil, configError{fmt.Errorf("read config %s: %w", path, err)}
+			return nil, configFileError(path, err)
 		}
 	} else {
 		v.SetConfigName("config")
@@ -107,7 +112,7 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 		}
 		if err := v.ReadInConfig(); err != nil {
 			if _, notFound := err.(viper.ConfigFileNotFoundError); !notFound {
-				return nil, configError{fmt.Errorf("read config: %w", err)}
+				return nil, configFileError(v.ConfigFileUsed(), err)
 			}
 		}
 		if _, err := os.Stat(localConfig); err == nil {
@@ -116,7 +121,7 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 	}
 	var c Config
 	if err := v.Unmarshal(&c); err != nil {
-		return nil, configError{fmt.Errorf("config: %w", err)}
+		return nil, decodeError(err)
 	}
 	c.Provider = strings.ToLower(strings.TrimSpace(c.Provider))
 	if c.APIKey == "" {
@@ -130,25 +135,75 @@ func load(cmd *cobra.Command, v *viper.Viper) (*Config, error) {
 		switch v {
 		case "", "off", "ask", "auto":
 		default:
-			return nil, configError{fmt.Errorf("--%s must be off, ask or auto", name)}
+			return nil, configError{fmt.Errorf("%s must be off, ask or auto, not %q", name, v), settingHint(name)}
 		}
 	}
+	if _, err := c.fallbacks(); err != nil {
+		return nil, err
+	}
 	return &c, nil
+}
+
+// fallbacks parses the fallbacks setting; nil means unset.
+func (c *Config) fallbacks() (*bool, error) {
+	var b bool
+	switch strings.ToLower(strings.TrimSpace(c.Fallbacks)) {
+	case "":
+		return nil, nil
+	case "true", "1", "yes", "on":
+		b = true
+	case "false", "0", "no", "off":
+	default:
+		return nil, configError{fmt.Errorf("fallbacks must be true or false, not %q", c.Fallbacks), settingHint("fallbacks")}
+	}
+	return &b, nil
+}
+
+// configFileError explains why the config file at path cannot be read.
+func configFileError(path string, err error) error {
+	var parse viper.ConfigParseError
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		err = fmt.Errorf("config file %s does not exist", path)
+	case errors.As(err, &parse):
+		err = fmt.Errorf("config file %s: %w", path, parse.Unwrap())
+	default:
+		err = fmt.Errorf("config file %s: %w", path, err)
+	}
+	return configError{err, "check --config or SENCTL_AGENT_CONFIG"}
+}
+
+// decodeError explains a setting whose value has the wrong type, such as
+// max_turns: lots.
+func decodeError(err error) error {
+	var de *mapstructure.DecodeError
+	if !errors.As(err, &de) {
+		return configError{fmt.Errorf("config: %w", err), ""}
+	}
+	var pe *mapstructure.ParseError
+	if errors.As(err, &pe) {
+		want := "a " + pe.Expected.Type().String()
+		switch pe.Expected.Kind() {
+		case reflect.Int, reflect.Int64:
+			want = "a whole number"
+		case reflect.Bool:
+			want = "true or false"
+		}
+		err = fmt.Errorf("%s must be %s, not %q", de.Name(), want, fmt.Sprint(pe.Value))
+	} else {
+		err = fmt.Errorf("%s: %w", de.Name(), de.Unwrap())
+	}
+	return configError{err, settingHint(de.Name())}
 }
 
 // provider builds the configured model provider. Without a model it takes
 // the library's default (llm.ResolveModel).
 func (c *Config) provider(ctx context.Context) (llm.Provider, llm.Options, error) {
-	cfg := llm.Config{Provider: c.Provider, APIKey: c.APIKey, BaseURL: c.BaseURL}
-	switch strings.ToLower(c.Fallbacks) {
-	case "true", "1", "yes", "on":
-		t := true
-		cfg.Fallbacks = &t
-	case "false", "0", "no", "off":
-		f := false
-		cfg.Fallbacks = &f
+	fallbacks, err := c.fallbacks()
+	if err != nil {
+		return nil, llm.Options{}, err
 	}
-	p, err := llm.New(cfg)
+	p, err := llm.New(llm.Config{Provider: c.Provider, APIKey: c.APIKey, BaseURL: c.BaseURL, Fallbacks: fallbacks})
 	if err != nil {
 		return nil, llm.Options{}, err
 	}
