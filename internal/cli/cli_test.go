@@ -59,6 +59,8 @@ func (f *fakeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		text = "The tool says: " + strings.SplitN(last["output"].(string), "\n", 2)[0]
 	case strings.Contains(last["content"].(string), "notes"):
 		call("read_file", `{"path":"notes.txt"}`)
+	case strings.Contains(last["content"].(string), "everything"):
+		call("pipeline", `{"path":"big.txt","command":"grep line"}`)
 	case strings.Contains(last["content"].(string), "create"):
 		call("write_file", `{"path":"hello.txt","content":"hi\n"}`)
 	default:
@@ -461,5 +463,36 @@ func TestConsoleUnlistedModels(t *testing.T) {
 	}
 	if len(proxy.requests) != 1 || proxy.requests[0]["model"] != "other" || proxy.requests[0]["reasoning"] != nil {
 		t.Fatalf("requests = %v", proxy.requests)
+	}
+}
+
+// Tool output too large for the model is saved, and the console says so.
+func TestConsoleSpillNotice(t *testing.T) {
+	srv := httptest.NewServer(&fakeProxy{})
+	defer srv.Close()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	dir := workspace(t)
+	var b strings.Builder
+	for i := 1; i <= 5000; i++ {
+		fmt.Fprintf(&b, "line %d of a big file\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, err := run(t, strings.NewReader("show everything\n/exit\n"), "--base-url", srv.URL, "--model", "m", "--dir", dir)
+	if err != nil {
+		t.Fatalf("console: %v %s", err, stderr)
+	}
+	for _, want := range []string{
+		"⏺ pipeline",
+		"↳ pipeline output is 117 KB (5000 lines), too large to send whole: saved to ",
+		"-output.txt; the model sees its start and end",
+		"The tool says: [This output is", // the model got the preview, not the whole output
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("console output missing %q:\n%s", want, out)
+		}
 	}
 }

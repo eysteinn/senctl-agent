@@ -121,8 +121,19 @@ func TestRun(t *testing.T) {
 			saved = s
 			return "/cache/" + tool + ".txt", nil
 		}
-		if _, _, err := Run(context.Background(), conv, "go", []Tool{big}, submit, Config{MaxToolOutput: 900, Spill: spill}, nil); err != nil {
+		var events []Event
+		rec := func(_ context.Context, e Event) { events = append(events, e) }
+		if _, _, err := Run(context.Background(), conv, "go", []Tool{big}, submit, Config{MaxToolOutput: 900, Spill: spill}, rec); err != nil {
 			t.Fatal(err)
+		}
+		var spilled []string
+		for _, e := range events {
+			if e.Kind == EventSpill {
+				spilled = append(spilled, e.Content)
+			}
+		}
+		if len(spilled) != 1 || spilled[0] != "big output is 9 KB (1000 lines), too large to send whole: saved to /cache/big.txt; the model sees its start and end" {
+			t.Fatalf("spill events = %q", spilled)
 		}
 		c := conv.sent[1].results[0].Content
 		if saved != out || len(c) > 1200 {
